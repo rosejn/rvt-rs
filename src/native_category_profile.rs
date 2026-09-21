@@ -147,13 +147,16 @@ const MEP_BUL: &[&str] = &[
 // and `arch-category-witness-20260921-v2`. The latter covers Ceiling, Grid,
 // ProfileRoof, StairsElement, StairsRun, and StairsLanding. `ContFooting` was
 // checked on all seven ARCH BUL `OST_StructuralFoundation` reference owners,
-// each with a complete native graph. Curtain panels are
-// `FamilyInstance` owners and are intentionally excluded until their precise
-// native type relationship is recovered. These are not caption/type-name
-// heuristics; unknown classes remain unresolved. `RoomElem` is deliberately
-// excluded: its category is carried by the saved room/space scheme fields and
-// is resolved by `native_delivery` from those fields, never from the shared
-// serialized class name.
+// each with a complete native graph. The type-owner classes below are the
+// corresponding serialized definition owners for those same native families;
+// their category is a structural class fact, not a caption/type-name
+// heuristic. The 2026-09-21 ARCH missing-owner probe recovered these exact
+// classes for the omitted type rows. Curtain panels are `FamilyInstance`
+// owners and are intentionally excluded until their precise native type
+// relationship is recovered. Unknown classes remain unresolved. `RoomElem` is
+// deliberately excluded: its category is carried by the saved room/space
+// scheme fields and is resolved by `native_delivery` from those fields, never
+// from the shared serialized class name.
 const OWNER_CLASS_CATEGORIES: &[(&str, i64)] = &[
     ("CableTray", -2_008_130),
     ("RbsCableTrayCurve", -2_008_130),
@@ -169,15 +172,30 @@ const OWNER_CLASS_CATEGORIES: &[(&str, i64)] = &[
     ("RbsPipingSystem", -2_008_043),
     ("RbsPipingSystemType", -2_008_043),
     ("Level", -2_000_240),
-	("SWall", -2_000_011),
-	("Floor", -2_000_032),
-	("Ceiling", -2_000_038),
-	("Grid", -2_000_220),
-	("ProfileRoof", -2_000_035),
-	("StairsElement", -2_000_120),
-	("StairsRun", -2_000_919),
-	("StairsLanding", -2_000_920),
+    ("LevelAttributes", -2_000_240),
+    ("SWall", -2_000_011),
+    ("BasicWallType", -2_000_011),
+    ("NewCurtainWallType", -2_000_011),
+    ("Floor", -2_000_032),
+    ("FloorAttributes", -2_000_032),
+    ("Ceiling", -2_000_038),
+    ("CompoundCeilingType", -2_000_038),
+    ("Grid", -2_000_220),
+    ("GridAttributes", -2_000_220),
+    ("ProfileRoof", -2_000_035),
+    ("RoofAttributes", -2_000_035),
+    ("CurtainRoofAttributes", -2_000_035),
+    ("StairsElement", -2_000_120),
+    ("StairsType", -2_000_120),
+    ("StairsAttributes", -2_000_120),
+    ("StairsRun", -2_000_919),
+    ("StairsRunType", -2_000_919),
+    ("StairsLanding", -2_000_920),
+    ("StairsLandingType", -2_000_920),
     ("ContFooting", -2_001_300),
+    ("ContFootingType", -2_001_300),
+    ("RampAttributes", -2_000_180),
+    ("Text3dAttrSymbol", -2_000_151),
 ];
 
 pub fn category_id(label: &str) -> Option<i64> {
@@ -251,15 +269,34 @@ mod tests {
         assert_eq!(resolve_profile("mep-bul-v1").unwrap().len(), MEP_BUL.len());
         assert_eq!(category_label(-2_008_044), Some("OST_PipeCurves"));
         assert_eq!(owner_class_category_id("RbsPipeCurve"), Some(-2_008_044));
-		assert_eq!(owner_class_category_id("SWall"), Some(-2_000_011));
-		assert_eq!(owner_class_category_id("Floor"), Some(-2_000_032));
-		assert_eq!(owner_class_category_id("Ceiling"), Some(-2_000_038));
-		assert_eq!(owner_class_category_id("Grid"), Some(-2_000_220));
-		assert_eq!(owner_class_category_id("ProfileRoof"), Some(-2_000_035));
-		assert_eq!(owner_class_category_id("StairsElement"), Some(-2_000_120));
-		assert_eq!(owner_class_category_id("StairsRun"), Some(-2_000_919));
-		assert_eq!(owner_class_category_id("StairsLanding"), Some(-2_000_920));
+        assert_eq!(owner_class_category_id("SWall"), Some(-2_000_011));
+        assert_eq!(owner_class_category_id("Floor"), Some(-2_000_032));
+        assert_eq!(owner_class_category_id("Ceiling"), Some(-2_000_038));
+        assert_eq!(owner_class_category_id("Grid"), Some(-2_000_220));
+        assert_eq!(owner_class_category_id("ProfileRoof"), Some(-2_000_035));
+        assert_eq!(owner_class_category_id("StairsElement"), Some(-2_000_120));
+        assert_eq!(owner_class_category_id("StairsRun"), Some(-2_000_919));
+        assert_eq!(owner_class_category_id("StairsLanding"), Some(-2_000_920));
         assert_eq!(owner_class_category_id("ContFooting"), Some(-2_001_300));
+        for (class_name, category_id) in [
+            ("LevelAttributes", -2_000_240),
+            ("BasicWallType", -2_000_011),
+            ("NewCurtainWallType", -2_000_011),
+            ("FloorAttributes", -2_000_032),
+            ("CompoundCeilingType", -2_000_038),
+            ("GridAttributes", -2_000_220),
+            ("RoofAttributes", -2_000_035),
+            ("CurtainRoofAttributes", -2_000_035),
+            ("StairsType", -2_000_120),
+            ("StairsAttributes", -2_000_120),
+            ("StairsRunType", -2_000_919),
+            ("StairsLandingType", -2_000_920),
+            ("ContFootingType", -2_001_300),
+            ("RampAttributes", -2_000_180),
+            ("Text3dAttrSymbol", -2_000_151),
+        ] {
+            assert_eq!(owner_class_category_id(class_name), Some(category_id));
+        }
         assert!(owner_class_category_id("RoomElem").is_none());
         assert!(owner_class_category_id("UnqualifiedNativeClass").is_none());
         assert!(resolve_profile("not-a-profile").is_err());
