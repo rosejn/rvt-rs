@@ -873,6 +873,7 @@ pub fn join_records_with_diagnostics(
         extra_diagnostics,
         None,
         None,
+        None,
     )
 }
 
@@ -884,6 +885,7 @@ fn join_records_with_diagnostics_and_catalog(
     extra_diagnostics: &[String],
     parameter_definitions: Option<Vec<ParameterDefinitionRow>>,
     parameter_bindings: Option<Vec<crate::native_parameter_definitions::Binding>>,
+    category_registry: Option<&crate::native_parameter_definitions::Registry>,
 ) -> Result<DeliveryPackage> {
     ensure!(
         !document_namespace.trim().is_empty(),
@@ -1088,7 +1090,15 @@ fn join_records_with_diagnostics_and_catalog(
             .map(|r| r.identity.element_id)
             .or_else(|| mesh.map(|g| g.id))
             .unwrap_or_default();
-        let category_id = category_id(record)?;
+        // Preserve the checked category recovery used by selection in the
+        // delivered owner row as well. Direct metadata remains authoritative;
+        // the definition-chain, room-scheme, and owner-class paths are
+        // bounded provenance-backed recoveries, not a display-name guess.
+        let category_id = match (record, category_registry) {
+            (Some(record), Some(registry)) => root_category_id_with_definitions(record, registry)?
+                .map(|(category_id, _)| category_id),
+            _ => category_id(record)?,
+        };
         let geometry_bounds_meters =
             graphics_receipt.and_then(|element| geometry_bounds_meters(element));
         let geometry_diagnostics = graphics_receipt.map(|element| {
@@ -1658,6 +1668,7 @@ fn extract_using_index_internal_with_cache_and_records(
                 .cloned()
                 .collect(),
         ),
+        Some(&definition_context.registry),
     )?;
     package.apply_profile(options.profile);
     if let Some((context, boundaries, lifecycle, room_connections, network)) = spatial_inventory {
@@ -2719,6 +2730,7 @@ mod tests {
                 category_id: -2008044,
                 elem_or_symbol: 1,
             }]),
+            None,
         )
         .unwrap();
         assert_eq!(package.parameter_bindings.len(), 1);

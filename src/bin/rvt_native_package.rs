@@ -703,6 +703,13 @@ fn write_process_sharded_package_with_ids(
                 }))?,
             )?;
         }
+        // A worker killed at its budget boundary can leave its atomic output
+        // staging sibling behind even after the parent retries the shard
+        // successfully. At this point every pending shard has been consumed
+        // and the manifest contains the complete successful set, so those
+        // exact failed-attempt siblings are safe to remove before publish.
+        // Never remove ordinary shard directories or unrelated files here.
+        cleanup_abandoned_shard_staging(&staging)?;
         fs::rename(&staging, &a.output_dir)?;
         Ok(())
     })();
@@ -750,6 +757,27 @@ fn remove_failed_shard_output(parent: &Path, shard_output: &Path) -> Result<()> 
         }
     }
     Ok(())
+}
+
+fn cleanup_abandoned_shard_staging(parent: &Path) -> Result<usize> {
+    let mut removed = 0usize;
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(".shard-") || !name.ends_with(".staging") {
+            continue;
+        }
+        ensure!(
+            entry.file_type()?.is_dir(),
+            "shard staging sibling is not a directory"
+        );
+        fs::remove_dir_all(entry.path())?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// The parent owns the document-scoped parameter catalogs in an isolated
@@ -1012,6 +1040,27 @@ mod tests {
         assert!(!hidden.exists());
         assert!(completed.exists());
         assert!(remove_failed_shard_output(&root, &root.join("not-a-shard")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn final_publish_cleanup_removes_only_abandoned_shard_staging_siblings() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rvt-native-package-final-cleanup-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join(".shard-000123.staging")).unwrap();
+        fs::create_dir_all(root.join("shard-000122")).unwrap();
+        fs::write(root.join("manifest.json"), b"{}\n").unwrap();
+        let removed = cleanup_abandoned_shard_staging(&root).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!root.join(".shard-000123.staging").exists());
+        assert!(root.join("shard-000122").exists());
+        assert!(root.join("manifest.json").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
