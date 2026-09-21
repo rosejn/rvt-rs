@@ -198,6 +198,10 @@ pub struct Registry {
     pub builtin_catalog_provenance: Option<Value>,
     pub bindings: BTreeMap<i64, Binding>,
     pub family_categories: BTreeMap<i64, i64>,
+    pub family_names: BTreeMap<i64, String>,
+    pub family_omniclass_codes: BTreeMap<i64, String>,
+    pub family_classification_descriptions: BTreeMap<i64, String>,
+    pub family_structural_code_names: BTreeMap<i64, String>,
     pub symbol_families: BTreeMap<i64, i64>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -260,8 +264,54 @@ impl Registry {
                     "conflicting family categories"
                 );
                 self.family_categories.insert(id, category);
+                if let Some(name) = root.fields.get("m_name").and_then(Value::as_str) {
+                    ensure!(
+                        self.family_names
+                            .get(&id)
+                            .is_none_or(|previous| previous == name),
+                        "conflicting family names"
+                    );
+                    self.family_names.insert(id, name.to_owned());
+                }
+                if let Some(value) = root.fields.get("m_omniClassCode").and_then(Value::as_str) {
+                    ensure!(
+                        self.family_omniclass_codes
+                            .get(&id)
+                            .is_none_or(|previous| previous == value),
+                        "conflicting family OmniClass code"
+                    );
+                    self.family_omniclass_codes.insert(id, value.to_owned());
+                }
+                if let Some(value) = root
+                    .fields
+                    .get("m_classificationDescription")
+                    .and_then(Value::as_str)
+                {
+                    ensure!(
+                        self.family_classification_descriptions
+                            .get(&id)
+                            .is_none_or(|previous| previous == value),
+                        "conflicting family classification description"
+                    );
+                    self.family_classification_descriptions
+                        .insert(id, value.to_owned());
+                }
+                if let Some(value) = root
+                    .fields
+                    .get("m_structuralCodeName")
+                    .and_then(Value::as_str)
+                {
+                    ensure!(
+                        self.family_structural_code_names
+                            .get(&id)
+                            .is_none_or(|previous| previous == value),
+                        "conflicting family structural code name"
+                    );
+                    self.family_structural_code_names
+                        .insert(id, value.to_owned());
+                }
             }
-            "FamilySymbol" => {
+            class_name if is_family_symbol_definition_owner(class_name) => {
                 let family = identifier(&root.fields["m_familyId"])?;
                 ensure!(
                     self.symbol_families
@@ -281,7 +331,9 @@ impl Registry {
             .first()
             .ok_or_else(|| anyhow::anyhow!("empty binding owner"))?;
         let (family, kind) = match root.class_name.as_str() {
-            "FamilySymbol" => (identifier(&root.fields["m_familyId"])?, 2),
+            class_name if is_family_symbol_definition_owner(class_name) => {
+                (identifier(&root.fields["m_familyId"])?, 2)
+            }
             "FamilyInstance" => {
                 let symbol = identifier(&root.fields["m_masterSymbolId"])?;
                 let Some(family) = self.symbol_families.get(&symbol) else {
@@ -460,6 +512,20 @@ impl Registry {
         })
     }
 }
+
+/// Native classes whose `m_familyId` is the serialized type-to-Family edge.
+///
+/// This is deliberately an explicit, witnessed vocabulary rather than a
+/// suffix/prefix heuristic. `SysMullionFamSym` and `SysPanelFamSym` were
+/// observed in the ARCH BUL source as `m_masterSymbolId` targets of curtain
+/// `FamilyInstance` owners; their `m_familyId` values resolve to `Family`
+/// owners with authoritative Mullion and Curtain Panel categories.
+pub fn is_family_symbol_definition_owner(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "FamilySymbol" | "SysMullionFamSym" | "SysPanelFamSym"
+    )
+}
 fn enrich_unit(definition: &mut Definition, formats: &BTreeMap<String, Value>) {
     if let Some(format) = definition
         .spec_type_id
@@ -499,6 +565,41 @@ mod tests {
             {"class_tag":11,"class_name":class,"token":4294967295u32,"start":100,"fields_end":200,"fields":{
                 "m_paramElemId":42,"m_caption":"Same caption","m_typeId":{"m_typeId":"test:definition"}}}],
             "edges":[{"source_object_index":0,"pointer_offset":90,"pointer_token":4294967295u32,"target_object_index":1,"target_class_tag":11}]})).unwrap()
+    }
+    #[test]
+    fn witnessed_system_mullion_symbol_uses_its_family_category_chain() {
+        assert!(is_family_symbol_definition_owner("FamilySymbol"));
+        assert!(is_family_symbol_definition_owner("SysMullionFamSym"));
+		assert!(is_family_symbol_definition_owner("SysPanelFamSym"));
+        assert!(!is_family_symbol_definition_owner("SysDoorFamSym"));
+
+        let mut registry = Registry::default();
+        let mut family = graph("Unused");
+        family.objects.truncate(1);
+        family.edges.clear();
+        family.objects[0].class_name = "Family".into();
+        family.objects[0].fields = json!({"m_id":1532,"m_categoryId":-2000171});
+        registry.ingest_binding_context(&family).unwrap();
+		family.objects[0].fields = json!({"m_id":1497,"m_categoryId":-2000170});
+		registry.ingest_binding_context(&family).unwrap();
+
+        let mut symbol = graph("Unused");
+        symbol.objects.truncate(1);
+        symbol.edges.clear();
+        symbol.objects[0].class_name = "SysMullionFamSym".into();
+        symbol.objects[0].fields = json!({"m_id":17605165,"m_familyId":1532});
+        registry.ingest_binding_context(&symbol).unwrap();
+        assert_eq!(registry.symbol_families.get(&17605165), Some(&1532));
+        assert_eq!(registry.family_categories.get(&1532), Some(&-2000171));
+		symbol.objects[0].class_name = "SysPanelFamSym".into();
+		symbol.objects[0].fields = json!({"m_id":5701313,"m_familyId":1497});
+		registry.ingest_binding_context(&symbol).unwrap();
+		assert_eq!(registry.symbol_families.get(&5701313), Some(&1497));
+		assert_eq!(registry.family_categories.get(&1497), Some(&-2000170));
+
+        symbol.objects[0].class_name = "FamilyInstance".into();
+        symbol.objects[0].fields = json!({"m_id":17429804,"m_masterSymbolId":17605165});
+        assert!(registry.matching_bindings(&symbol).unwrap().is_empty());
     }
     #[test]
     fn absent_state_requires_category_kind_and_bidirectional_binding() {

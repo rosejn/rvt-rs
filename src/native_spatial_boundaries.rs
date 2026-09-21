@@ -75,6 +75,7 @@ pub struct Inventory {
     pub format: &'static str,
     pub complete_boundary_parity: bool,
     pub semantics: &'static str,
+    pub level_elevations: BTreeMap<i64, f64>,
     pub rooms: Vec<Room>,
     pub topologies: Vec<Topology>,
     pub diagnostics: Vec<String>,
@@ -300,11 +301,13 @@ impl InventoryBuilder {
                 }
             }
         }
+        let level_elevations = self.evaluation.level_elevations();
         let openings = self.evaluation.openings(&self.identities);
         Ok(Inventory {
             format: "rvt-native-spatial-boundaries/v1",
             complete_boundary_parity: false,
             semantics: "saved_carriers_and_explicitly_qualified_boundary_evaluations_internal_feet",
+            level_elevations,
             rooms: self.rooms,
             topologies: self.topologies,
             diagnostics: self.diagnostics,

@@ -131,6 +131,7 @@ pub mod geometry;
 pub mod identity;
 pub mod ifc;
 pub mod level_bind;
+pub mod native_category_profile;
 pub mod native_document;
 pub mod native_element;
 pub mod native_equipment;
@@ -204,6 +205,9 @@ pub mod native_content_documents;
 
 pub mod native_family_geometry;
 
+pub mod native_delivery_glb;
+pub mod native_delivery_spatial;
+pub mod native_delivery_tiles;
 pub mod native_room_connections;
 pub mod native_spatial_boundaries;
 
@@ -211,6 +215,7 @@ pub mod native_revision;
 
 pub mod native_surfaces;
 
+pub mod native_delivery;
 pub mod native_empty_faces;
 pub mod native_es_catalog;
 pub mod native_export_metadata;

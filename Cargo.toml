@@ -278,6 +278,10 @@ name = "rvt-native-document"
 path = "src/bin/rvt_native_document.rs"
 
 [[bin]]
+name = "rvt-native-record-probe"
+path = "src/bin/rvt_native_record_probe.rs"
+
+[[bin]]
 name = "rvt-native-equipment"
 path = "src/bin/rvt_native_equipment.rs"
 
@@ -296,3 +300,7 @@ path = "src/bin/rvt_native_saved_scene.rs"
 [[bin]]
 name = "rvt-native-network"
 path = "src/bin/rvt_native_network.rs"
+
+[[bin]]
+name = "rvt-native-package"
+path = "src/bin/rvt_native_package.rs"

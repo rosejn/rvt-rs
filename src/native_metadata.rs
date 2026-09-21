@@ -85,7 +85,22 @@ pub(crate) fn identifier(value: &Value) -> Result<i64> {
             return identifier(inner);
         }
     }
-    anyhow::bail!("unsupported saved identifier shape")
+    let shape = match value {
+        Value::Object(fields) => format!(
+            "object keys [{}]",
+            fields
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Array(values) => format!("array length {}", values.len()),
+        Value::String(_) => "string".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::Null => "null".to_string(),
+        Value::Number(_) => "non-integer number".to_string(),
+    };
+    anyhow::bail!("unsupported saved identifier shape ({shape})")
 }
 /// Project owner parameter sets only through explicit graph edges. Family slots
 /// retain their containing object index and every stored slot without implying
@@ -109,6 +124,25 @@ pub fn project(graph: &ObjectGraph) -> Result<SavedMetadata> {
         resolved_family_parameters: Vec::new(),
     };
     let mut direct_fields = Vec::new();
+    // `m_categoryId` is structurally useful to native category selection, but
+    // is not a generic API `Category` parameter.  For example, a
+    // `GraphicsStyle` stores the category it styles even when its own API
+    // Category parameter is unset.  Keep that raw root fact available through
+    // `native_delivery::category_id`, and project it as an API built-in only
+    // for the witnessed family-owner classes where the two identities agree.
+    if root.class_name == "FamilyInstance"
+        || crate::native_parameter_definitions::is_family_symbol_definition_owner(
+            &root.class_name,
+        )
+    {
+        direct_fields.extend([("m_categoryId", -1140362), ("m_categoryId", -1140363)]);
+    }
+    // Design option is an element-level built-in, not a FamilyInstance-only
+    // property.  Every decoded root that actually stores the field can retain
+    // its serialized identifier.  This does not claim API applicability or
+    // translate sentinel values: callers still receive the saved value and
+    // the `serialized_not_evaluated` provenance below.
+    direct_fields.push(("m_designOptionId", -1013201));
     if matches!(
         root.class_name.as_str(),
         "FamilyInstance" | "RbsPipeCurve" | "SWall"
@@ -127,11 +161,7 @@ pub fn project(graph: &ObjectGraph) -> Result<SavedMetadata> {
             ("m_assocLevelId", -1002062),
             ("m_assocLevelId", -1001352),
             ("m_hostId", -1002108),
-            ("m_designOptionId", -1013201),
         ]);
-    }
-    if root.class_name == "MaterialElem" {
-        direct_fields.push(("m_designOptionId", -1013201));
     }
     for (field, parameter_id) in direct_fields {
         if let Some(value) = root.fields.get(field) {
@@ -143,6 +173,52 @@ pub fn project(graph: &ObjectGraph) -> Result<SavedMetadata> {
                 projection_rule: "direct_saved_field",
                 storage_type: "ElementId".into(),
                 raw_value: identifier(value)?.into(),
+                value_semantics: "serialized_not_evaluated",
+            });
+        }
+    }
+    if root.class_name == "AnalyticalMember" {
+        for (field, parameter_id) in [
+            ("m_lowestAssocLevel", -1_155_257),
+            ("m_highestAssocLevel", -1_155_256),
+            ("m_materialId", -1_005_500),
+        ] {
+            if let Some(value) = root.fields.get(field) {
+                result.raw_field_parameters.push(RawFieldParameter {
+                    parameter_id,
+                    source_object: 0,
+                    source_field: field.into(),
+                    source_element_id: None,
+                    projection_rule: "direct_saved_field",
+                    storage_type: "ElementId".into(),
+                    raw_value: identifier(value)?.into(),
+                    value_semantics: "serialized_not_evaluated",
+                });
+            }
+        }
+        if let Some(value) = root.fields.get("m_crossSectionRotation") {
+            ensure!(value.is_number(), "cross-section rotation is not numeric");
+            result.raw_field_parameters.push(RawFieldParameter {
+                parameter_id: -1_013_456,
+                source_object: 0,
+                source_field: "m_crossSectionRotation".into(),
+                source_element_id: None,
+                projection_rule: "direct_saved_field",
+                storage_type: "Double".into(),
+                raw_value: value.clone(),
+                value_semantics: "serialized_not_evaluated",
+            });
+        }
+        if let Some(value) = root.fields.get("m_structuralRole") {
+            ensure!(value.as_i64().is_some(), "structural role is not an integer");
+            result.raw_field_parameters.push(RawFieldParameter {
+                parameter_id: -1_013_453,
+                source_object: 0,
+                source_field: "m_structuralRole".into(),
+                source_element_id: None,
+                projection_rule: "direct_saved_field",
+                storage_type: "Integer".into(),
+                raw_value: value.clone(),
                 value_semantics: "serialized_not_evaluated",
             });
         }
@@ -200,6 +276,64 @@ pub fn project(graph: &ObjectGraph) -> Result<SavedMetadata> {
                 });
             }
         }
+    }
+    // These HVAC load-type fields were independently checked against the
+    // Revit 2027 full-inspect witness: each mapping below has exact saved/API
+    // agreement across every observed owner with non-sentinel values.  Do not
+    // include the saved lighting/power schedule references here: their values
+    // coincided in this population, so their API identity is not yet proven.
+    match root.class_name.as_str() {
+        "HVACLoadSpaceTypeElem" => append_fields(
+            &mut result,
+            graph,
+            0,
+            "",
+            &[
+                ("m_idOccupancySchedule", -1114349, "ElementId"),
+                ("m_heatingSetPoint", -1114708, "Double"),
+                ("m_coolingSetPoint", -1114709, "Double"),
+                ("m_LightingLoadDensity", -1114220, "Double"),
+                ("m_dAreaPerPerson", -1114175, "Double"),
+                ("m_PowerLoadDensity", -1114219, "Double"),
+                ("m_dLatentHeatGainPerPerson", -1114189, "Double"),
+                ("m_dOutdoorAirPerPerson", -1154665, "Double"),
+            ],
+        )?,
+        "HVACLoadBuildingTypeElem" => append_fields(
+            &mut result,
+            graph,
+            0,
+            "",
+            &[
+                ("m_idOccupancySchedule", -1114349, "ElementId"),
+                ("m_LightingLoadDensity", -1114220, "Double"),
+                ("m_dAreaPerPerson", -1114175, "Double"),
+                ("m_PowerLoadDensity", -1114219, "Double"),
+                ("m_strEquipmentStartTime", -1114355, "String"),
+                ("m_strEquipmentEndTime", -1114356, "String"),
+            ],
+        )?,
+        // Witnessed independently across 298 analytical members; unlike the
+        // nearby rebar fields, this identifier has one non-coincident API
+        // target in the full inspect population.
+        "AnalyticalMember" => append_fields(
+            &mut result,
+            graph,
+            0,
+            "",
+            &[("m_sectionType", -1009533, "ElementId")],
+        )?,
+        // `DPart.m_assocLevelId` exactly matched the Base Level API parameter
+        // across the 91 observed non-sentinel parts.  Other associated-level
+        // parameters remain class-specific and are not inferred from this.
+        "DPart" => append_fields(
+            &mut result,
+            graph,
+            0,
+            "",
+            &[("m_assocLevelId", -1152335, "ElementId")],
+        )?,
+        _ => {}
     }
     if root.class_name == "RbsPipeCurve" {
         append_fields(
@@ -497,7 +631,13 @@ pub fn project_with_definitions(graph: &ObjectGraph, registry: &Registry) -> Res
     let root = &graph.objects[0];
     result.global_parameter_associations = project_global_associations(graph)?;
     let family_id = match root.class_name.as_str() {
-        "FamilySymbol" => root.fields.get("m_familyId").map(identifier).transpose()?,
+        class_name
+            if crate::native_parameter_definitions::is_family_symbol_definition_owner(
+                class_name,
+            ) =>
+        {
+            root.fields.get("m_familyId").map(identifier).transpose()?
+        }
         "FamilyInstance" => root
             .fields
             .get("m_masterSymbolId")
@@ -520,6 +660,59 @@ pub fn project_with_definitions(graph: &ObjectGraph, registry: &Registry) -> Res
                 raw_value: (*category).into(),
                 value_semantics: "serialized_not_evaluated",
             });
+        }
+    }
+    // `FamilySymbol.m_familyId` identifies the same-document Family record;
+    // the Family root's saved `m_name` is a String and is only projected for
+    // the witnessed Family Name built-in after that reference resolves.  Do
+    // not substitute the numeric family id for the API string value.
+    if crate::native_parameter_definitions::is_family_symbol_definition_owner(&root.class_name)
+        && let Some(family_id) = family_id
+        && let Some(name) = registry.family_names.get(&family_id)
+    {
+        result.raw_field_parameters.push(RawFieldParameter {
+            parameter_id: -1002002,
+            source_object: 0,
+            source_field: "m_familyId->Family.m_name".into(),
+            source_element_id: Some(family_id),
+            projection_rule: "owner_symbol_family_name_reference_chain",
+            storage_type: "String".into(),
+            raw_value: name.clone().into(),
+            value_semantics: "serialized_not_evaluated",
+        });
+    }
+    if crate::native_parameter_definitions::is_family_symbol_definition_owner(&root.class_name)
+        && let Some(family_id) = family_id
+    {
+        for (parameter_id, source_field, value) in [
+            (
+                -1_002_502,
+                "m_familyId->Family.m_omniClassCode",
+                registry.family_omniclass_codes.get(&family_id),
+            ),
+            (
+                -1_002_503,
+                "m_familyId->Family.m_classificationDescription",
+                registry.family_classification_descriptions.get(&family_id),
+            ),
+            (
+                -1_005_556,
+                "m_familyId->Family.m_structuralCodeName",
+                registry.family_structural_code_names.get(&family_id),
+            ),
+        ] {
+            if let Some(value) = value {
+                result.raw_field_parameters.push(RawFieldParameter {
+                    parameter_id,
+                    source_object: 0,
+                    source_field: source_field.into(),
+                    source_element_id: Some(family_id),
+                    projection_rule: "owner_symbol_family_string_reference_chain",
+                    storage_type: "String".into(),
+                    raw_value: value.clone().into(),
+                    value_semantics: "serialized_not_evaluated",
+                });
+            }
         }
     }
     let ids: std::collections::BTreeSet<i64> = result
@@ -1032,7 +1225,78 @@ mod tests {
         assert!(project(&graph).is_err());
     }
     #[test]
-    fn direct_fields_preserve_internal_sentinels_and_require_class() {
+    fn projects_witnessed_hvac_load_type_fields_without_schedule_alias_guessing() {
+        let graph: ObjectGraph = serde_json::from_value(json!({"consumed_bytes":12,"objects":[
+            {"class_tag":20,"class_name":"HVACLoadSpaceTypeElem","token":0,"start":2,"fields_end":12,
+             "fields":{"m_idOccupancySchedule":91,"m_heatingSetPoint":288.7,
+                       "m_coolingSetPoint":299.8,"m_LightingLoadDensity":8.6,
+                       "m_dAreaPerPerson":358.7,"m_PowerLoadDensity":3.2,
+                       "m_dLatentHeatGainPerPerson":630.9,"m_dOutdoorAirPerPerson":0.08,
+                       "m_idLightingSchedule":92,"m_idPowerSchedule":93}}],"edges":[]}))
+        .unwrap();
+        let projected = project(&graph).unwrap();
+        let ids = projected
+            .raw_field_parameters
+            .iter()
+            .map(|parameter| parameter.parameter_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                -1114349, -1114708, -1114709, -1114220, -1114175, -1114219, -1114189,
+                -1154665,
+            ]
+        );
+        assert!(projected
+            .raw_field_parameters
+            .iter()
+            .all(|parameter| parameter.value_semantics == "serialized_not_evaluated"));
+    }
+    #[test]
+    fn projects_only_the_witnessed_analytical_and_part_level_fields() {
+        let graph = |class_name, fields| {
+            serde_json::from_value(json!({"consumed_bytes":12,"objects":[
+                {"class_tag":20,"class_name":class_name,"token":0,"start":2,"fields_end":12,
+                 "fields":fields}],"edges":[]}))
+            .unwrap()
+        };
+        let analytical: ObjectGraph = graph("AnalyticalMember", json!({"m_sectionType":41}));
+        let analytical = project(&analytical).unwrap();
+        assert_eq!(analytical.raw_field_parameters.len(), 1);
+        assert_eq!(analytical.raw_field_parameters[0].parameter_id, -1009533);
+        assert_eq!(analytical.raw_field_parameters[0].raw_value, json!(41));
+        let part: ObjectGraph = graph("DPart", json!({"m_assocLevelId":{"m_id64":61}}));
+        let part = project(&part).unwrap();
+        assert_eq!(part.raw_field_parameters.len(), 1);
+        assert_eq!(part.raw_field_parameters[0].parameter_id, -1152335);
+        assert_eq!(part.raw_field_parameters[0].raw_value, json!(61));
+    }
+    #[test]
+    fn analytical_member_direct_fields_keep_their_witnessed_storage_types() {
+        let graph: ObjectGraph = serde_json::from_value(json!({"consumed_bytes":12,"objects":[
+            {"class_tag":20,"class_name":"AnalyticalMember","token":0,"start":2,"fields_end":12,
+             "fields":{"m_lowestAssocLevel":41,"m_highestAssocLevel":42,
+                "m_materialId":43,"m_crossSectionRotation":-1.5,"m_structuralRole":2}}],"edges":[]}))
+        .unwrap();
+        let projected = project(&graph).unwrap();
+        let values = projected
+            .raw_field_parameters
+            .iter()
+            .map(|parameter| (parameter.parameter_id, parameter.storage_type.as_str(), &parameter.raw_value))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                (-1_155_257, "ElementId", &json!(41)),
+                (-1_155_256, "ElementId", &json!(42)),
+                (-1_005_500, "ElementId", &json!(43)),
+                (-1_013_456, "Double", &json!(-1.5)),
+                (-1_013_453, "Integer", &json!(2)),
+            ]
+        );
+    }
+    #[test]
+    fn direct_fields_preserve_internal_sentinels_and_project_root_design_option() {
         let mut graph: ObjectGraph = serde_json::from_value(json!({"consumed_bytes":12,"objects":[
             {"class_tag":20,"class_name":"FamilyInstance","token":0,"start":2,"fields_end":12,
              "fields":{"m_masterSymbolId":24,"m_designOptionId":-4}}],"edges":[]}))
@@ -1049,8 +1313,75 @@ mod tests {
             -4
         );
         graph.objects[0].class_name = "UnknownOwner".into();
-        assert!(project(&graph).unwrap().raw_field_parameters.is_empty());
+        let unknown = project(&graph).unwrap();
+        assert_eq!(unknown.raw_field_parameters.len(), 1);
+        let design_option = &unknown.raw_field_parameters[0];
+        assert_eq!(design_option.parameter_id, -1013201);
+        assert_eq!(design_option.source_field, "m_designOptionId");
+        assert_eq!(design_option.raw_value, json!(-4));
+        assert_eq!(design_option.value_semantics, "serialized_not_evaluated");
     }
+
+    #[test]
+    fn graphics_style_category_is_not_promoted_to_its_api_category_parameter() {
+        let graph: ObjectGraph = serde_json::from_value(json!({"consumed_bytes":12,"objects":[
+            {"class_tag":20,"class_name":"GStyleElem","token":0,"start":2,"fields_end":12,
+             "fields":{"m_categoryId":-2000011}}],"edges":[]}))
+        .unwrap();
+        let projected = project(&graph).unwrap();
+        assert!(projected.raw_field_parameters.is_empty());
+    }
+
+    #[test]
+    fn family_symbol_name_requires_the_resolved_same_document_family() {
+        let graph: ObjectGraph = serde_json::from_value(json!({"consumed_bytes":12,"objects":[
+            {"class_tag":20,"class_name":"FamilySymbol","token":0,"start":2,"fields_end":12,
+             "fields":{"m_familyId":41}}],"edges":[]}))
+        .unwrap();
+        let mut registry = Registry::default();
+        registry.family_names.insert(41, "Witnessed family".into());
+        registry.family_omniclass_codes.insert(41, "23.25.05.17".into());
+        registry
+            .family_classification_descriptions
+            .insert(41, "Witnessed classification".into());
+        registry
+            .family_structural_code_names
+            .insert(41, "Witnessed code name".into());
+        let projected = project_with_definitions(&graph, &registry).unwrap();
+        let parameter = projected
+            .raw_field_parameters
+            .iter()
+            .find(|parameter| parameter.parameter_id == -1002002)
+            .unwrap();
+        assert_eq!(parameter.storage_type, "String");
+        assert_eq!(parameter.raw_value, json!("Witnessed family"));
+        assert_eq!(parameter.source_element_id, Some(41));
+        assert_eq!(
+            parameter.projection_rule,
+            "owner_symbol_family_name_reference_chain"
+        );
+        let strings = projected
+            .raw_field_parameters
+            .iter()
+            .filter(|parameter| {
+                [-1_002_502, -1_002_503, -1_005_556].contains(&parameter.parameter_id)
+            })
+            .map(|parameter| (parameter.parameter_id, parameter.raw_value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(strings.get(&-1_002_502), Some(&json!("23.25.05.17")));
+        assert_eq!(
+            strings.get(&-1_002_503),
+            Some(&json!("Witnessed classification"))
+        );
+        assert_eq!(strings.get(&-1_005_556), Some(&json!("Witnessed code name")));
+
+        let absent = project_with_definitions(&graph, &Registry::default()).unwrap();
+        assert!(absent
+            .raw_field_parameters
+            .iter()
+            .all(|parameter| parameter.parameter_id != -1002002));
+    }
+
     #[test]
     fn selects_owner_edge_and_preserves_all_family_slots() {
         let object = |name, fields| json!({"class_tag":20,"class_name":name,"token":4294967295u32,"start":2,"fields_end":4,"fields":fields});

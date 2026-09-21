@@ -34,6 +34,10 @@ struct Args {
     max_stream_bytes: u64,
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
     max_group_bytes: usize,
+    /// Strict source-bound ES declaration/layout witness.  This admits only
+    /// the exact source hash and never makes a general Revit API import.
+    #[arg(long)]
+    extensible_storage_witness: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -64,6 +68,7 @@ struct Report {
     surfaces: Option<native_surfaces::Inventory>,
     room_connections: Option<native_room_connections::Inventory>,
     extensible_storage: Option<rvt::native_extensible_storage::Inventory>,
+    extensible_storage_witness: Option<serde_json::Value>,
     wall_joins: Option<std::collections::BTreeMap<u64, rvt::native_wall_joins::JoinResult>>,
     error: Option<String>,
     projection_coverage: BTreeMap<String, ProjectionStatus>,
@@ -109,6 +114,7 @@ fn run(args: Args) -> Result<u8> {
         surfaces: None,
         room_connections: None,
         extensible_storage: None,
+        extensible_storage_witness: None,
         wall_joins: None,
         error: None,
         projection_coverage: BTreeMap::new(),
@@ -127,6 +133,18 @@ fn run(args: Args) -> Result<u8> {
             digest.update(&chunk[..count]);
         }
         report.source_sha256 = Some(format!("{:x}", digest.finalize()));
+        let source_bound_es_catalog = if let Some(path) = &args.extensible_storage_witness {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("read source-bound ES witness {}", path.display()))?;
+            let (catalog, receipt) = rvt::native_es_catalog::decode_source_bound_witness(
+                &bytes,
+                report.source_sha256.as_deref().expect("source hash"),
+            )?;
+            report.extensible_storage_witness = Some(receipt);
+            Some(catalog)
+        } else {
+            None
+        };
         let mut file = rvt::RevitFile::open(&args.file)?;
         let mut revision = native_revision::InventoryBuilder::default();
         revision.set_source_sha256(report.source_sha256.clone().expect("source hash"))?;
@@ -149,7 +167,18 @@ fn run(args: Args) -> Result<u8> {
             max_graph_objects: args.max_graph_objects,
             ..Default::default()
         };
-        report.coverage = Some(native_document::extract(&mut file, &options, |record| {
+        let physical_index = native_document::build_physical_index(&mut file, &options)?;
+        let mut definition_context =
+            native_document::build_definition_context(&mut file, &options, &physical_index)?;
+        if let Some(supplement) = source_bound_es_catalog {
+            if let Some(native_catalog) = definition_context.extensible_storage_catalog.as_mut() {
+                native_catalog.extend_nonconflicting(supplement)?;
+            } else {
+                definition_context.extensible_storage_catalog = Some(supplement);
+            }
+        }
+        report.coverage = Some(native_document::extract_using_index_with_context(
+            &mut file, &options, &physical_index, &definition_context, true, |record| {
             if record.class_name.as_deref() == Some("SWall") {
                 wall_ids.insert(record.identity.element_id);
             }

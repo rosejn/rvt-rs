@@ -4,7 +4,7 @@ use crate::schema_registry::Registry;
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::{collections::BTreeSet, io::Read};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupSource {
@@ -60,6 +60,141 @@ pub fn walk(
     prepared: &[u8],
     registry: &Registry,
     max_group_bytes: usize,
+    callback: impl FnMut(&GroupSource, &[u8]) -> Result<()>,
+) -> Result<Statistics> {
+    walk_selected_impl(prepared, registry, max_group_bytes, None, callback)
+}
+
+/// Walk only the complete groups whose first marker offsets are selected.
+/// Marker framing and continuation state are still traversed for every group,
+/// but unselected gzip payloads are not inflated. Callers must obtain offsets
+/// from a prior complete `walk`; skipped payload checks therefore rely on that
+/// indexed validation pass.
+pub fn walk_selected(
+    prepared: &[u8],
+    registry: &Registry,
+    max_group_bytes: usize,
+    selected_group_offsets: &BTreeSet<usize>,
+    callback: impl FnMut(&GroupSource, &[u8]) -> Result<()>,
+) -> Result<Statistics> {
+    walk_selected_impl(
+        prepared,
+        registry,
+        max_group_bytes,
+        Some(selected_group_offsets),
+        callback,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema_registry::{Class, Reference, Registry};
+    use std::{collections::BTreeSet, io::Write};
+
+    fn registry() -> Registry {
+        let classes = [
+            (12, "ContentMarker"),
+            (13, "ContentKey"),
+            (14, "SegmentMarker"),
+            (15, "SegmentCheckback"),
+            (16, "SignatureMarker"),
+        ]
+        .into_iter()
+        .map(|(tag, name)| Class {
+            tag,
+            name: name.into(),
+            offset: 0,
+            parent_reference: Reference {
+                offset: 0,
+                tag: 0,
+                introduces_definition: false,
+            },
+            version_like_word: 0,
+            fields: Vec::new(),
+            opaque_16byte_entry_count: 0,
+            opaque_entries_offset: 0,
+            opaque_entries_sha256: String::new(),
+            end: 0,
+        })
+        .collect::<Vec<_>>();
+        Registry {
+            source_sha256: String::new(),
+            consumed_bytes: 0,
+            reference_count: 0,
+            terminator_offset: 0,
+            classes,
+        }
+    }
+
+    fn gzip(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut encoder = flate2::write::GzEncoder::new(&mut out, flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap();
+        out
+    }
+
+    fn segment(out: &mut Vec<u8>, payload: &[u8], flags: u32) -> usize {
+        let offset = out.len();
+        let compressed = gzip(payload);
+        let size = 8 + compressed.len() as u32;
+        out.extend(14u16.to_le_bytes());
+        out.extend(flags.to_le_bytes());
+        out.extend(1u32.to_le_bytes());
+        out.extend(size.to_le_bytes());
+        out.extend((payload.len() as u32).to_le_bytes());
+        out.extend(102u64.to_le_bytes());
+        out.extend(compressed);
+        out.extend(15u16.to_le_bytes());
+        out.extend(size.to_le_bytes());
+        offset
+    }
+
+    #[test]
+    fn selected_walk_skips_unselected_gzip_payloads_but_preserves_group_framing() {
+        let mut prepared = vec![0; 8];
+        prepared.extend(12u16.to_le_bytes());
+        prepared.extend(0u32.to_le_bytes());
+        prepared.extend(0u32.to_le_bytes());
+        let first = segment(&mut prepared, b"first", 4);
+        let second = segment(&mut prepared, b"second", 4);
+        prepared.extend(12u16.to_le_bytes());
+        prepared.extend(0u32.to_le_bytes());
+        prepared.extend(u32::MAX.to_le_bytes());
+
+        let mut all = Vec::new();
+        walk(&prepared, &registry(), 1024, |_, bytes| {
+            all.push(bytes.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(all, vec![b"first".to_vec(), b"second".to_vec()]);
+
+        let mut selected = Vec::new();
+        let stats = walk_selected(
+            &prepared,
+            &registry(),
+            1024,
+            &BTreeSet::from([second]),
+            |_, bytes| {
+                selected.push(bytes.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(selected, vec![b"second".to_vec()]);
+        assert_eq!(stats.groups, 2);
+        assert_eq!(stats.inflated_bytes, 6);
+        assert_ne!(first, second);
+    }
+}
+
+fn walk_selected_impl(
+    prepared: &[u8],
+    registry: &Registry,
+    max_group_bytes: usize,
+    selected_group_offsets: Option<&BTreeSet<usize>>,
     mut callback: impl FnMut(&GroupSource, &[u8]) -> Result<()>,
 ) -> Result<Statistics> {
     ensure!(max_group_bytes > 0, "zero partition group budget");
@@ -82,7 +217,7 @@ pub fn walk(
     let mut stats = Statistics::default();
     let mut content_key = None;
     let mut last_size = None;
-    let mut active: Option<(GroupSource, Vec<u8>)> = None;
+    let mut active: Option<(GroupSource, Option<Vec<u8>>)> = None;
     loop {
         let offset = r.pos;
         let next = r.u16()?;
@@ -134,21 +269,32 @@ pub fn walk(
             );
             let channel = r.u64()?;
             let compressed = r.take(size as usize - 8)?;
-            let mut decoder = flate2::bufread::GzDecoder::new(compressed);
-            let mut bytes = Vec::new();
-            (&mut decoder)
-                .take(max_group_bytes as u64 + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() <= max_group_bytes,
-                "inflated segment group budget exceeded"
-            );
-            ensure!(
-                decoder.get_ref().is_empty(),
-                "gzip does not consume exact declared segment boundary"
-            );
+            let target = active
+                .as_ref()
+                .map(|(_, bytes)| bytes.is_some())
+                .unwrap_or_else(|| {
+                    selected_group_offsets.is_none_or(|offsets| offsets.contains(&offset))
+                });
+            let bytes = if target {
+                let mut decoder = flate2::bufread::GzDecoder::new(compressed);
+                let mut bytes = Vec::new();
+                (&mut decoder)
+                    .take(max_group_bytes as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                ensure!(
+                    bytes.len() <= max_group_bytes,
+                    "inflated segment group budget exceeded"
+                );
+                ensure!(
+                    decoder.get_ref().is_empty(),
+                    "gzip does not consume exact declared segment boundary"
+                );
+                stats.inflated_bytes += bytes.len() as u64;
+                Some(bytes)
+            } else {
+                None
+            };
             stats.segments += 1;
-            stats.inflated_bytes += bytes.len() as u64;
             last_size = Some(size);
             let from_previous = flags & 1 != 0;
             let to_next = flags & 2 != 0;
@@ -161,13 +307,17 @@ pub fn walk(
                     source.channel == channel && source.content_key == content_key,
                     "continuation channel/content mismatch"
                 );
-                ensure!(
-                    data.len()
-                        .checked_add(bytes.len())
-                        .is_some_and(|n| n <= max_group_bytes),
-                    "reassembled group budget exceeded"
-                );
-                data.extend(bytes);
+                if let Some(data) = data.as_ref() {
+                    ensure!(
+                        data.len()
+                            .checked_add(bytes.as_ref().map_or(0, Vec::len))
+                            .is_some_and(|n| n <= max_group_bytes),
+                        "reassembled group budget exceeded"
+                    );
+                }
+                if let (Some(data), Some(bytes)) = (data.as_mut(), bytes) {
+                    data.extend(bytes);
+                }
                 source.segment_count += 1;
                 source.declared_objects += u64::from(count);
                 source.declared_body_bytes += u64::from(raw);
@@ -186,7 +336,9 @@ pub fn walk(
             }
             if !to_next {
                 let (source, bytes) = active.take().unwrap();
-                callback(&source, &bytes)?;
+                if let Some(bytes) = bytes {
+                    callback(&source, &bytes)?;
+                }
                 stats.groups += 1;
             }
         } else if next == checkback_tag {

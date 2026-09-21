@@ -4,9 +4,9 @@
 
 This distribution also includes an opt-in native saved-record/world-model path
 alongside the legacy walker/exporter. The native commands are
-`rvt-native-document`, `rvt-native-scene`, `rvt-native-equipment`,
+`rvt-native-document`, `rvt-native-record-probe`, `rvt-native-scene`, `rvt-native-equipment`,
 `rvt-native-world-model`, `rvt-native-revision-diff`,
-`rvt-native-saved-scene`, and `rvt-native-network`.
+`rvt-native-saved-scene`, `rvt-native-network`, and `rvt-native-package`.
 
 The native path provides bounded JSON and GLB projections for supported saved
 records, spatial context, relationships, parameters, materials, lifecycle
@@ -36,7 +36,7 @@ current production walker.
 
 For the non-technical workflow, start with the [`docs/user-guide.md`](docs/user-guide.md). Installation paths live in [`docs/install.md`](docs/install.md). For the short support boundary, read [`docs/status.md`](docs/status.md), the supported MVP input profile in [`docs/supported-profile.md`](docs/supported-profile.md), and the executable capability matrix in [`docs/support-matrix.json`](docs/support-matrix.json) (statuses are honest ceilings, not converter-grade claims). The detailed roadmap tasks live in [`TODO.md`](TODO.md) and the matching GitHub milestones/issues.
 
-Rust 2024 edition (MSRV 1.85). **Twenty-five CLIs ship** (`rvt-analyze`, `rvt-info`, `rvt-inspect`, `rvt-schema`, `rvt-history`, `rvt-diff`, `rvt-corpus`, `rvt-dump`, `rvt-doc`, `rvt-ifc`, `rvt-ifc-compare`, `gen-fixture`, `rvt-write`, `rvt-gltf`, `rvt-sheet`, `rvt-elem-table`, `rvt-elements`, `rvt-capabilities`, `rvt-native-scene`, `rvt-native-document`, `rvt-native-equipment`, `rvt-native-world-model`, `rvt-native-revision-diff`, `rvt-native-saved-scene`, `rvt-native-network`) plus 36 reproducible probes under `examples/`. Python bindings via pyo3+maturin in the `rvt-py` workspace member (SEC-12/13 — the core `rvt` crate is unconditionally `#![forbid(unsafe_code)]`) — `pip install rvt`.
+Rust 2024 edition (MSRV 1.85). **Twenty-seven CLIs ship** (`rvt-analyze`, `rvt-info`, `rvt-inspect`, `rvt-schema`, `rvt-history`, `rvt-diff`, `rvt-corpus`, `rvt-dump`, `rvt-doc`, `rvt-ifc`, `rvt-ifc-compare`, `gen-fixture`, `rvt-write`, `rvt-gltf`, `rvt-sheet`, `rvt-elem-table`, `rvt-elements`, `rvt-capabilities`, `rvt-native-scene`, `rvt-native-document`, `rvt-native-record-probe`, `rvt-native-equipment`, `rvt-native-world-model`, `rvt-native-revision-diff`, `rvt-native-saved-scene`, `rvt-native-network`, `rvt-native-package`) plus 36 reproducible probes under `examples/`. Python bindings via pyo3+maturin in the `rvt-py` workspace member (SEC-12/13 — the core `rvt` crate is unconditionally `#![forbid(unsafe_code)]`) — `pip install rvt`.
 
 ## What works today
 

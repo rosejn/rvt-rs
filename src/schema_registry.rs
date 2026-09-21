@@ -165,6 +165,22 @@ impl<'a> Reader<'a> {
                     references.push(actual);
                 }
             }
+            // Dynamic composite containers carry the nested field descriptor
+            // followed by its runtime element-class reference.  Fixed
+            // composites instead carry their count before the nested
+            // descriptor and repeat its references above.  Treating the
+            // trailing reference as the next field's name length desynchronizes
+            // older schemas (notably 2018 SiteSurface.m_facets).
+            if modifier == 0x50 && !nested.references.is_empty() {
+                let expected = &nested.references[0];
+                let actual = self.reference()?;
+                ensure!(
+                    actual.tag == expected.tag,
+                    "dynamic composite reference mismatch at {}",
+                    actual.offset
+                );
+                references.push(actual);
+            }
             Some(Box::new(nested))
         } else {
             None
@@ -310,6 +326,19 @@ mod tests {
         b.extend([0; 8]);
         b
     }
+    fn dynamic_composite_fixture() -> Vec<u8> {
+        // A dynamic composite has no schema count. Its nested descriptor is
+        // followed by one runtime element-class reference, which must be
+        // consumed before the enclosing definition's next field.
+        let mut parent = 0x800du16.to_le_bytes().to_vec();
+        parent.extend(definition("Parent", &[0, 0], &[]));
+        let mut dynamic = field("Items", 0x500d);
+        dynamic.extend(field("Item", 0x000e));
+        dynamic.extend(13u16.to_le_bytes());
+        dynamic.extend(13u16.to_le_bytes());
+        let b = definition("Outer", &parent, &[dynamic, field("After", 0x0004)]);
+        [b, vec![0; 8]].concat()
+    }
     #[test]
     fn recursive_registry_slots_and_composite_reference_repetitions() {
         let bytes = fixture();
@@ -322,6 +351,15 @@ mod tests {
         assert_eq!(r.class(12).unwrap().fields[0].references.len(), 2);
         assert_eq!(r.classes[0].version_like_word, 7);
         assert!(r.class(11).is_none());
+    }
+    #[test]
+    fn dynamic_composite_consumes_its_trailing_class_reference() {
+        let r = parse(&dynamic_composite_fixture()).unwrap();
+        let fields = &r.class(12).unwrap().fields;
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].references.len(), 2);
+        assert_eq!(fields[0].end, fields[1].offset);
+        assert_eq!(fields[1].name, "After");
     }
     #[test]
     fn malformed_descriptors_references_and_truncations_are_rejected() {

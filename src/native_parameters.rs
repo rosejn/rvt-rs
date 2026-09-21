@@ -56,6 +56,19 @@ pub struct ObjectGraph {
     pub objects: Vec<GraphObject>,
     pub edges: Vec<GraphEdge>,
 }
+/// The directly serialized root of an owning record, without traversal of its
+/// deferred pointer graph.  This is deliberately smaller than [`ObjectGraph`]:
+/// callers such as category selection need direct owner fields (notably
+/// `m_categoryId`) but must not materialize every symbol, parameter set, or
+/// graphics cache reachable from an otherwise unselected owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootObject {
+    pub class_tag: u16,
+    pub class_name: String,
+    pub fields: Value,
+    pub consumed_bytes: usize,
+    pub values: usize,
+}
 /// A non-null, non-external serialized pointer resolved within this bounded
 /// owning body. Object indices refer to `ObjectGraph::objects`; pointer offsets
 /// are absolute byte offsets within the body, including pointers inside inline
@@ -135,6 +148,7 @@ pub fn decode_graph_with_catalog_usage(
         pos: 2,
         items: 0,
         pending: Vec::new(),
+        collect_deferred_pointers: true,
         spans: Vec::new(),
         limits: *limits,
     };
@@ -152,7 +166,9 @@ pub fn decode_graph_with_catalog_usage(
         let (name, fields) = if let Some(guid) = &schema_guid {
             (
                 "ExtensibleStorageEntity".to_string(),
-                cursor.entity_fields(guid)?,
+                cursor
+                    .entity_fields(guid)
+                    .map_err(|error| anyhow::anyhow!("ES entity {guid} starts{start}: {error}"))?,
             )
         } else {
             let name = registry
@@ -230,6 +246,57 @@ pub fn decode_graph_with_catalog_usage(
         usage,
     ))
 }
+
+/// Decode exactly the root object's inline fields and stop before deferred
+/// pointer targets.  The returned cursor position is intentionally allowed to
+/// precede `body.len()`: those remaining bytes belong to deferred objects and
+/// are not evidence of malformed root fields.
+///
+/// This is a selection primitive, not a substitute for full metadata or
+/// geometry extraction.  A selected owner must still receive one full decode
+/// when it is packaged.
+pub fn decode_root_with_catalog_usage(
+    body: &[u8],
+    registry: &Registry,
+    limits: &GraphLimits,
+    catalog: Option<&crate::native_extensible_storage::Catalog>,
+) -> Result<RootObject> {
+    ensure!(
+        limits.max_values > 0 && limits.max_objects > 0 && limits.max_depth > 0,
+        "native graph resource budgets must be positive"
+    );
+    ensure!(body.len() >= 2, "truncated root object tag");
+    let class_tag = u16::from_le_bytes(body[..2].try_into()?);
+    let class_name = registry
+        .class(class_tag)
+        .ok_or_else(|| anyhow::anyhow!("graph class absent"))?
+        .name
+        .clone();
+    let mut cursor = Cursor {
+        body,
+        registry,
+        catalog,
+        pos: 2,
+        items: 0,
+        pending: Vec::new(),
+        // Root selection records pointer field values but deliberately does
+        // not retain their deferred targets.  Retaining them is both useless
+        // and disproportionately costly on large owner populations.
+        collect_deferred_pointers: false,
+        spans: Vec::new(),
+        limits: *limits,
+    };
+    let fields = cursor
+        .class(class_tag, 0)
+        .map_err(|error| anyhow::anyhow!("root graph {class_name} starts2: {error}"))?;
+    Ok(RootObject {
+        class_tag,
+        class_name,
+        fields,
+        consumed_bytes: cursor.pos,
+        values: cursor.items,
+    })
+}
 /// Decode the field sequence of a caller-established inline/deferred object.
 /// The caller supplies the bounded owning body and exact offset/class; this
 /// routine does not locate objects or resolve pointer tokens automatically.
@@ -255,6 +322,7 @@ pub fn decode_object_fields(
         pos: start,
         items: 0,
         pending: Vec::new(),
+        collect_deferred_pointers: true,
         spans: Vec::new(),
         limits: GraphLimits::default(),
     };
@@ -281,6 +349,10 @@ struct Cursor<'a> {
     pos: usize,
     items: usize,
     pending: Vec<PendingPointer>,
+    /// Full graph decoding queues deferred pointers; root-only decoding must
+    /// consume their inline reference representation without retaining a
+    /// queue that it will never traverse.
+    collect_deferred_pointers: bool,
     spans: Vec<FieldSpan>,
     limits: GraphLimits,
 }
@@ -309,12 +381,14 @@ impl Cursor<'_> {
                 self.registry.class(tag).is_some(),
                 "unknown native pointer class {tag}"
             );
-            self.pending.push(PendingPointer {
-                token,
-                class_tag: tag,
-                offset,
-                schema_guid: None,
-            });
+            if self.collect_deferred_pointers {
+                self.pending.push(PendingPointer {
+                    token,
+                    class_tag: tag,
+                    offset,
+                    schema_guid: None,
+                });
+            }
             Some(tag)
         } else {
             None
@@ -337,12 +411,14 @@ impl Cursor<'_> {
             self.catalog.is_some_and(|c| c.schemas.contains_key(&guid)),
             "ES entity schema catalog absent for {guid}"
         );
-        self.pending.push(PendingPointer {
-            token: u32::MAX,
-            class_tag: 0,
-            offset,
-            schema_guid: Some(guid.clone()),
-        });
+        if self.collect_deferred_pointers {
+            self.pending.push(PendingPointer {
+                token: u32::MAX,
+                class_tag: 0,
+                offset,
+                schema_guid: Some(guid.clone()),
+            });
+        }
         Ok(
             json!({"discriminator":-1,"schema_guid":guid,"state":"serialized_present","offset":offset}),
         )
@@ -362,6 +438,18 @@ impl Cursor<'_> {
                 .all(|(i, f)| f.index as usize == i),
             "ES field indices are not unique and contiguous"
         );
+        let prefix_bytes = schema
+            .raw_metadata
+            .get("source_bound_payload_prefix_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        ensure!(
+            prefix_bytes <= 64,
+            "ES source-bound payload prefix exceeds bounded qualification"
+        );
+        let prefix_start = self.pos;
+        let prefix = self.take(prefix_bytes as usize)?.to_vec();
+        let prefix_end = self.pos;
         let mut values = Vec::new();
         for field in fields {
             let start = self.pos;
@@ -376,7 +464,12 @@ impl Cursor<'_> {
             };
             values.push(json!({"index":field.index,"name":field.name,"type_name":field.type_name,"container_type":field.container_type,"spec_type_id":field.spec_type_id,"subschema_guid":field.subschema_guid,"start":start,"end":self.pos,"raw_value":raw_value,"value_semantics":"serialized_value","serialized_unit_type_id":serialized_unit_type_id,"unit_status":unit_status}));
         }
-        Ok(json!({"schema_guid":guid,"schema_name":schema.name,"fields":values}))
+        Ok(json!({
+            "schema_guid":guid,
+            "schema_name":schema.name,
+            "source_bound_payload_prefix": (!prefix.is_empty()).then(|| json!({"start":prefix_start,"end":prefix_end,"bytes":prefix})),
+            "fields":values,
+        }))
     }
     fn es_value(&mut self, name: &str, container: i32) -> Result<Value> {
         ensure!(
@@ -491,7 +584,47 @@ impl Cursor<'_> {
                     f.uninterpreted_flags
                 );
                 let start = self.pos;
-                let value = if c.name == "ClassDefinitionRef"
+                let compact_field = match (c.name.as_str(), f.name.as_str()) {
+                    (_, "m_edgeHistTable") => Some(("edge-history table", 1_000_000)),
+                    ("FilledGeomTable", "m_table") => Some(("filled geometry table", 1_000_000)),
+                    ("GeomTable", "m_table") => Some(("geometry table", 1_000_000)),
+                    // This document-global byte vector is a derived steel-model
+                    // cache. It is not a semantic input to either the ES schema
+                    // catalog or the qualified saved-geometry projection.  It
+                    // has been observed at 2,085,221 bytes in the DACH 2026
+                    // corpus, so consume it without allocating JSON entries,
+                    // while retaining a finite, field-specific validation cap.
+                    ("SteelModelInfo", "m_steelModelLatest") => {
+                        Some(("derived steel-model cache", 4_000_000))
+                    }
+                    // Raster payloads are stored as a dynamic byte vector.
+                    // They are image content rather than element semantics,
+                    // and materializing multi-megabyte compressed streams as
+                    // JSON scalars would turn a bounded graph walk into a
+                    // memory-amplification path.  Keep their field presence
+                    // and exact byte count with the same finite cap used for
+                    // other observed opaque caches.
+                    ("ARasterImage", "m_compressedImage") => {
+                        Some(("opaque compressed raster payload", 4_000_000))
+                    }
+                    _ => None,
+                };
+                let value = if c.name == "SpotElevation" && f.name == "m_bendOrPosPtOffset" {
+                    self.optional_nonfinite_f64_vector(f, depth + distance + 1)?
+                } else if let Some((reason, max_items)) = compact_field {
+                    // The saved-graphics and metadata projections do not use
+                    // these derived geometry caches. They can contain tens of
+                    // thousands of inline values, so retain each field's
+                    // presence/count while consuming it without materializing
+                    // a large JSON subtree. This is deliberately scoped to
+                    // known cache fields; other graph data remains strict.
+                    let item_count = self.skip_field_value(f, depth + distance + 1, max_items)?;
+                    json!({
+                        "native_field_skipped": format!("{}.{}", c.name, f.name),
+                        "reason": format!("{reason}; not_materialized_in_bounded_native_graph"),
+                        "item_count": item_count,
+                    })
+                } else if c.name == "ClassDefinitionRef"
                     && f.name == "m_ref"
                     && f.base == 10
                     && f.modifier == 0
@@ -518,7 +651,14 @@ impl Cursor<'_> {
                     self.field(&qualified, depth + distance + 1)?
                 } else {
                     self.field(f, depth + distance + 1).map_err(|e| {
-                        anyhow::anyhow!("{}.{} at {}: {e}", c.name, f.name, self.pos)
+                        anyhow::anyhow!(
+                            "{}.{} [base={}, modifier=0x{:x}] at {}: {e}",
+                            c.name,
+                            f.name,
+                            f.base,
+                            f.modifier,
+                            self.pos
+                        )
                     })?
                 };
                 self.spans.push(FieldSpan {
@@ -542,6 +682,164 @@ impl Cursor<'_> {
             }
         }
         Ok(Value::Object(values))
+    }
+    fn skip_field_value(
+        &mut self,
+        f: &Field,
+        depth: usize,
+        max_container_items: usize,
+    ) -> Result<usize> {
+        ensure!(
+            depth < self.limits.max_depth,
+            "native field recursion budget exceeded ({})",
+            self.limits.max_depth
+        );
+        ensure!(
+            self.items < self.limits.max_values,
+            "native field value budget exceeded ({})",
+            self.limits.max_values
+        );
+        self.items += 1;
+        self.skip_field_value_inner(f, depth, max_container_items)
+    }
+    fn skip_field_value_inner(
+        &mut self,
+        f: &Field,
+        depth: usize,
+        max_container_items: usize,
+    ) -> Result<usize> {
+        ensure!(
+            depth < self.limits.max_depth,
+            "native compact field recursion budget exceeded ({})",
+            self.limits.max_depth
+        );
+        match f.modifier {
+            1..=3 if f.base == 14 => {
+                let token = self.u32()?;
+                if token != 0 && f.modifier != 3 {
+                    let tag = u16::from_le_bytes(self.take(2)?.try_into()?);
+                    ensure!(
+                        self.registry.class(tag).is_some(),
+                        "unknown native pointer class {tag}"
+                    );
+                    anyhow::bail!(
+                        "compact native field encountered deferred pointer token {token}"
+                    );
+                }
+                Ok(0)
+            }
+            0x60 if f.base == 8 => {
+                let n = self.u32()? as usize;
+                ensure!(n <= 1_000_000, "native string unit budget exceeded");
+                self.take(
+                    n.checked_mul(2)
+                        .ok_or_else(|| anyhow::anyhow!("native compact string size overflow"))?,
+                )?;
+                Ok(0)
+            }
+            0x10 | 0x11 | 0x12 | 0x13 | 0x50 | 0x51 | 0x52 | 0x53 => {
+                let n = if f.modifier < 0x50 {
+                    f.array_count
+                        .ok_or_else(|| anyhow::anyhow!("fixed array schema count absent"))?
+                } else {
+                    self.u32()?
+                } as usize;
+                ensure!(
+                    n <= max_container_items,
+                    "native compact container count budget exceeded"
+                );
+                let mut item = f.clone();
+                item.modifier &= 0xf;
+                item.array_count = None;
+                for _ in 0..n {
+                    self.skip_field_value_inner(&item, depth + 1, max_container_items)?;
+                }
+                Ok(n)
+            }
+            0 => match f.base {
+                1 | 2 => {
+                    self.take(1)?;
+                    Ok(0)
+                }
+                3 => {
+                    self.take(2)?;
+                    Ok(0)
+                }
+                4 | 5 | 6 => {
+                    self.take(4)?;
+                    Ok(0)
+                }
+                7 => {
+                    self.take(8)?;
+                    Ok(0)
+                }
+                9 => {
+                    self.take(16)?;
+                    Ok(0)
+                }
+                11 => {
+                    self.take(8)?;
+                    Ok(0)
+                }
+                13 => self.skip_field_value_inner(
+                    f.nested_descriptor
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("nested schema absent"))?,
+                    depth + 1,
+                    max_container_items,
+                ),
+                14 => {
+                    ensure!(
+                        f.references.len() == 1,
+                        "inline native reference schema count"
+                    );
+                    self.skip_class(f.references[0].tag, depth + 1, max_container_items)?;
+                    Ok(0)
+                }
+                _ => anyhow::bail!("unsupported native compact scalar {}", f.base),
+            },
+            _ => anyhow::bail!("unsupported native compact modifier {}", f.modifier),
+        }
+    }
+    fn skip_class(&mut self, tag: u16, depth: usize, max_container_items: usize) -> Result<()> {
+        ensure!(
+            depth < self.limits.max_depth,
+            "native class recursion budget exceeded"
+        );
+        let mut lineage = Vec::new();
+        let mut current = tag;
+        loop {
+            ensure!(
+                depth + lineage.len() < self.limits.max_depth,
+                "native class recursion budget exceeded"
+            );
+            let c = self
+                .registry
+                .class(current)
+                .ok_or_else(|| anyhow::anyhow!("unknown inline native class {current}"))?
+                .clone();
+            current = c.parent_reference.tag;
+            lineage.push(c);
+            if current < 12 {
+                break;
+            }
+        }
+        for c in lineage.iter().rev() {
+            for f in &c.fields {
+                if f.uninterpreted_flags & 2 != 0 {
+                    continue;
+                }
+                ensure!(
+                    f.uninterpreted_flags == 0,
+                    "unsupported compact native field flags {}.{}: {}",
+                    c.name,
+                    f.name,
+                    f.uninterpreted_flags
+                );
+                self.skip_field_value_inner(f, depth + 1, max_container_items)?;
+            }
+        }
+        Ok(())
     }
     fn field(&mut self, f: &Field, depth: usize) -> Result<Value> {
         ensure!(
@@ -574,7 +872,11 @@ impl Cursor<'_> {
                 } else {
                     self.u32()?
                 };
-                ensure!(n <= 100_000, "native container count budget exceeded");
+                ensure!(
+                    n <= self.limits.max_values.min(1_000_000) as u32,
+                    "native container count budget exceeded ({n}; limit {})",
+                    self.limits.max_values.min(1_000_000)
+                );
                 let mut item = f.clone();
                 item.modifier &= 0xf;
                 item.array_count = None;
@@ -624,6 +926,52 @@ impl Cursor<'_> {
             _ => anyhow::bail!("unsupported native modifier {}", f.modifier),
         }
     }
+
+    /// `SpotElevation.m_bendOrPosPtOffset` is an optional fixed f64 vector.
+    /// Some real records encode an absent component as a non-finite IEEE value.
+    /// Preserve that source fact explicitly instead of manufacturing a spatial
+    /// coordinate or allowing it to poison a JSON number.
+    fn optional_nonfinite_f64_vector(&mut self, f: &Field, depth: usize) -> Result<Value> {
+        ensure!(
+            f.base == 7 && f.modifier == 0x10,
+            "unexpected SpotElevation optional-offset schema"
+        );
+        ensure!(
+            depth < self.limits.max_depth,
+            "native field recursion budget exceeded ({})",
+            self.limits.max_depth
+        );
+        ensure!(
+            self.items < self.limits.max_values,
+            "native field value budget exceeded ({})",
+            self.limits.max_values
+        );
+        self.items += 1;
+        let count = f
+            .array_count
+            .ok_or_else(|| anyhow::anyhow!("SpotElevation optional-offset array count absent"))?;
+        ensure!(
+            count <= self.limits.max_values.min(1_000_000) as u32,
+            "native container count budget exceeded ({count}; limit {})",
+            self.limits.max_values.min(1_000_000)
+        );
+        let mut values = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            ensure!(
+                self.items < self.limits.max_values,
+                "native field value budget exceeded ({})",
+                self.limits.max_values
+            );
+            self.items += 1;
+            let value = f64::from_le_bytes(self.take(8)?.try_into()?);
+            values.push(if value.is_finite() {
+                json!(value)
+            } else {
+                json!({"native_nonfinite":"f64","semantic":"serialized_absent"})
+            });
+        }
+        Ok(Value::Array(values))
+    }
 }
 fn identifier(value: &Value) -> Result<i64> {
     value
@@ -644,6 +992,7 @@ pub fn decode(body: &[u8], registry: &Registry) -> Result<Parameters> {
         pos: 2,
         items: 0,
         pending: Vec::new(),
+        collect_deferred_pointers: true,
         spans: Vec::new(),
         limits: GraphLimits::default(),
     };
@@ -760,6 +1109,100 @@ mod tests {
     }
 
     #[test]
+    fn compact_byte_vector_can_use_a_field_specific_bound_without_materializing_values() {
+        let mut byte_vector = field("cache");
+        byte_vector.base = 2;
+        byte_vector.modifier = 0x50;
+        let count = 1_000_001usize;
+        let mut body = Vec::with_capacity(4 + count);
+        body.extend((count as u32).to_le_bytes());
+        body.resize(4 + count, 0x5a);
+        let empty = registry(Vec::new());
+        let mut cursor = Cursor {
+            body: &body,
+            registry: &empty,
+            catalog: None,
+            pos: 0,
+            items: 0,
+            pending: Vec::new(),
+            collect_deferred_pointers: false,
+            spans: Vec::new(),
+            limits: GraphLimits::default(),
+        };
+        assert_eq!(
+            cursor.skip_field_value(&byte_vector, 0, count).unwrap(),
+            count
+        );
+        assert_eq!(cursor.pos, body.len());
+        assert_eq!(cursor.items, 1);
+
+        let mut cursor = Cursor { pos: 0, ..cursor };
+        assert!(cursor.skip_field_value(&byte_vector, 0, count - 1).is_err());
+    }
+
+    #[test]
+    fn raster_payload_is_retained_as_bounded_opaque_field_metadata() {
+        let count = 1_000_001usize;
+        let mut compressed = field("m_compressedImage");
+        compressed.base = 2;
+        compressed.modifier = 0x50;
+        let registry = registry(vec![class(12, "ARasterImage", 0, vec![compressed])]);
+        let mut body = Vec::with_capacity(4 + count);
+        body.extend((count as u32).to_le_bytes());
+        body.resize(4 + count, 0x5a);
+        let mut cursor = Cursor {
+            body: &body,
+            registry: &registry,
+            catalog: None,
+            pos: 0,
+            items: 0,
+            pending: Vec::new(),
+            collect_deferred_pointers: false,
+            spans: Vec::new(),
+            limits: GraphLimits::default(),
+        };
+        let fields = cursor.class(12, 0).unwrap();
+        assert_eq!(cursor.pos, body.len());
+        assert_eq!(fields["m_compressedImage"]["item_count"], count);
+        assert_eq!(
+            fields["m_compressedImage"]["native_field_skipped"],
+            "ARasterImage.m_compressedImage"
+        );
+    }
+
+    #[test]
+    fn spot_elevation_optional_offset_preserves_nonfinite_sentinel() {
+        let mut offset = field("m_bendOrPosPtOffset");
+        offset.base = 7;
+        offset.modifier = 0x10;
+        offset.array_count = Some(3);
+        let registry = registry(vec![class(12, "SpotElevation", 0, vec![offset])]);
+        let mut body = Vec::new();
+        body.extend(1.25f64.to_le_bytes());
+        body.extend(f64::NAN.to_le_bytes());
+        body.extend((-2.5f64).to_le_bytes());
+        let mut cursor = Cursor {
+            body: &body,
+            registry: &registry,
+            catalog: None,
+            pos: 0,
+            items: 0,
+            pending: Vec::new(),
+            collect_deferred_pointers: false,
+            spans: Vec::new(),
+            limits: GraphLimits::default(),
+        };
+        let fields = cursor.class(12, 0).unwrap();
+        assert_eq!(cursor.pos, body.len());
+        assert_eq!(fields["m_bendOrPosPtOffset"][0], 1.25);
+        assert_eq!(
+            fields["m_bendOrPosPtOffset"][1],
+            json!({"native_nonfinite":"f64","semantic":"serialized_absent"})
+        );
+        assert_eq!(fields["m_bendOrPosPtOffset"][2], -2.5);
+    }
+
+    #[test]
     fn es_guid_payload_is_deferred_without_fabricated_class_tag() {
         let registry = registry(vec![class(
             12,
@@ -822,6 +1265,77 @@ mod tests {
         assert!(graph.edges.is_empty());
     }
 
+    #[test]
+    fn source_bound_es_layout_uses_measured_prefix_and_storage_index() {
+        let empty = registry(Vec::new());
+        let guid = "57c66e83-4651-496b-aebb-69d085752c1b";
+        let mut catalog = crate::native_extensible_storage::Catalog::default();
+        catalog
+            .insert(crate::native_extensible_storage::Schema {
+                guid: guid.into(),
+                name: "Measured".into(),
+                // Stored order is list, minor, major; API presentation order
+                // need not be the persisted entry-index order.
+                fields: vec![
+                    crate::native_extensible_storage::Field {
+                        index: 2,
+                        name: "Major".into(),
+                        type_name: "int".into(),
+                        container_type: 0,
+                        subschema_guid: None,
+                        spec_type_id: None,
+                        raw_metadata: json!(null),
+                    },
+                    crate::native_extensible_storage::Field {
+                        index: 1,
+                        name: "Minor".into(),
+                        type_name: "int".into(),
+                        container_type: 0,
+                        subschema_guid: None,
+                        spec_type_id: None,
+                        raw_metadata: json!(null),
+                    },
+                    crate::native_extensible_storage::Field {
+                        index: 0,
+                        name: "List".into(),
+                        type_name: "int".into(),
+                        container_type: 1,
+                        subschema_guid: None,
+                        spec_type_id: None,
+                        raw_metadata: json!(null),
+                    },
+                ],
+                raw_metadata: json!({"source_bound_payload_prefix_bytes":8}),
+            })
+            .unwrap();
+        let mut body = vec![0; 8];
+        body.extend(1u32.to_le_bytes());
+        body.extend(950884i32.to_le_bytes());
+        body.extend(2i32.to_le_bytes());
+        body.extend(1i32.to_le_bytes());
+        let mut cursor = Cursor {
+            body: &body,
+            registry: &empty,
+            catalog: Some(&catalog),
+            pos: 0,
+            items: 0,
+            pending: Vec::new(),
+            collect_deferred_pointers: false,
+            spans: Vec::new(),
+            limits: GraphLimits::default(),
+        };
+        let fields = cursor.entity_fields(guid).unwrap();
+        assert_eq!(cursor.pos, body.len());
+        assert_eq!(fields["fields"][0]["name"], "List");
+        assert_eq!(fields["fields"][0]["raw_value"], json!([950884]));
+        assert_eq!(fields["fields"][1]["raw_value"], 2);
+        assert_eq!(fields["fields"][2]["raw_value"], 1);
+        assert_eq!(
+            fields["source_bound_payload_prefix"]["bytes"],
+            json!(vec![0u8; 8])
+        );
+    }
+
     fn pointer_field(name: &str) -> Field {
         Field {
             base: 14,
@@ -831,9 +1345,98 @@ mod tests {
         }
     }
 
+    fn inline_field(name: &str, tag: u16) -> Field {
+        Field {
+            base: 14,
+            modifier: 0,
+            raw_descriptor: 14,
+            references: vec![Reference {
+                offset: 0,
+                tag,
+                introduces_definition: false,
+            }],
+            ..field(name)
+        }
+    }
+
+    fn vector_field(name: &str, base: u8) -> Field {
+        Field {
+            base,
+            modifier: 0x50,
+            raw_descriptor: u32::from(base) | (0x50 << 8),
+            ..field(name)
+        }
+    }
+
     fn append_pointer(body: &mut Vec<u8>, token: u32, tag: u16) {
         body.extend(token.to_le_bytes());
         body.extend(tag.to_le_bytes());
+    }
+
+    #[test]
+    fn root_decode_stops_before_deferred_pointer_targets() {
+        let registry = registry(vec![
+            class(12, "Owner", 0, vec![pointer_field("m_child")]),
+            class(13, "Deferred", 0, vec![field("m_id")]),
+        ]);
+        let mut body = 12u16.to_le_bytes().to_vec();
+        append_pointer(&mut body, 7, 13);
+        // A full graph decode consumes this child. The root selector must not.
+        body.extend(42i32.to_le_bytes());
+
+        let root = decode_root_with_catalog_usage(&body, &registry, &GraphLimits::default(), None)
+            .unwrap();
+        assert_eq!(root.class_name, "Owner");
+        assert_eq!(root.fields["m_child"]["pointer_token"], json!(7));
+        assert_eq!(root.consumed_bytes, 8);
+        assert!(root.consumed_bytes < body.len());
+    }
+
+    #[test]
+    fn wall_sweep_edge_history_is_compacted_without_relaxing_graph_budget() {
+        let mut edge_table = inline_field("m_edgeHistTable", 13);
+        edge_table.modifier = 0x50;
+        edge_table.raw_descriptor = 0x500e;
+        let registry = registry(vec![
+            class(12, "WallSweepWallGStep", 0, vec![edge_table]),
+            class(
+                13,
+                "EdgeHistEntry",
+                0,
+                vec![field("m_id"), inline_field("m_edgeHist", 14)],
+            ),
+            class(14, "EdgeHist", 0, vec![vector_field("m_keys", 4)]),
+        ]);
+        let mut body = 12u16.to_le_bytes().to_vec();
+        body.extend(256u32.to_le_bytes());
+        for id in 0..256u32 {
+            body.extend(id.to_le_bytes());
+            body.extend(3u32.to_le_bytes());
+            body.extend(
+                [1u32, 2, 3]
+                    .into_iter()
+                    .flat_map(|value| value.to_le_bytes()),
+            );
+        }
+        let graph = decode_graph_with_limits(
+            &body,
+            &registry,
+            &GraphLimits {
+                max_values: 1,
+                max_objects: 10,
+                max_depth: 16,
+            },
+        )
+        .unwrap();
+        assert_eq!(graph.consumed_bytes, body.len());
+        assert_eq!(
+            graph.objects[0].fields["m_edgeHistTable"]["item_count"],
+            json!(256)
+        );
+        assert_eq!(
+            graph.objects[0].fields["m_edgeHistTable"]["native_field_skipped"],
+            json!("WallSweepWallGStep.m_edgeHistTable")
+        );
     }
 
     #[test]

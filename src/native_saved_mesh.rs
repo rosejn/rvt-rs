@@ -38,7 +38,11 @@ pub struct CylinderTessellationProfile {
 impl Default for CylinderTessellationProfile {
     fn default() -> Self {
         Self {
-            chord_error: 0.001,
+            // Keep the default curved-face deviation below a tenth of a
+            // thousandth of a foot. The Revit API lab oracle includes small
+            // radius spheres/toruses where the previous 0.001 ft profile
+            // produced visible sub-percent volume residuals.
+            chord_error: 0.0001,
             max_v_edge: 1.0,
         }
     }
@@ -170,6 +174,16 @@ fn area(r: &[[f64; 2]]) -> f64 {
         .sum::<f64>()
         / 2.
 }
+
+fn face_tag(fields: &Value) -> Result<i64> {
+    fields["m_GInfo"]["m_tag"].as_i64().context("face tag")
+}
+
+fn point_on_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2], tolerance: f64) -> bool {
+    let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+    cross(a, b, p).abs() <= tolerance * length.max(1.)
+        && (p[0] - a[0]) * (p[0] - b[0]) + (p[1] - a[1]) * (p[1] - b[1]) <= tolerance
+}
 fn retain_boundary_points(
     points: &[[f64; 2]],
     boundary_edges: &BTreeSet<(u32, u32)>,
@@ -254,24 +268,20 @@ fn refined_plane_edge(
         .resolve(other, &g.objects[other].fields["m_pSurf"])?
         .context("shared edge surface missing")?;
     let kind = g.objects[other_surface].class_name.as_str();
-    if !matches!(kind, "CylSurf" | "SurfRev" | "RuledSurf") {
+    if !matches!(
+        kind,
+        "CylSurf" | "ConeSurf" | "SurfRev" | "RuledSurf" | "HermiteSurf"
+    ) {
         return Ok(original);
     }
     type SurfaceEval = Box<dyn Fn([f64; 2]) -> Result<[f64; 3]>>;
     let (u_values, v_values, evaluate): (Vec<f64>, Vec<f64>, SurfaceEval) = if kind == "CylSurf" {
         let profile = CylinderTessellationProfile::default();
-        let mesh = cylinder_face(g, other, profile)?;
-        let cylinder = mesh
-            .analytic_surface
-            .context("cylinder analytic metadata missing")?;
-        let min: [f64; 2] = std::array::from_fn(|k| {
-            mesh.trim_uv
-                .iter()
-                .map(|p| p[k])
-                .fold(f64::INFINITY, f64::min)
-        });
+        let (cylinder, trim_uv) = cylinder_refinement_data(g, index, other)?;
+        let min: [f64; 2] =
+            std::array::from_fn(|k| trim_uv.iter().map(|p| p[k]).fold(f64::INFINITY, f64::min));
         let max: [f64; 2] = std::array::from_fn(|k| {
-            mesh.trim_uv
+            trim_uv
                 .iter()
                 .map(|p| p[k])
                 .fold(f64::NEG_INFINITY, f64::max)
@@ -282,12 +292,12 @@ fn refined_plane_edge(
                 .sqrt()
                 .asin())
         .min(std::f64::consts::FRAC_PI_2);
-        let us = tessellation_axis(min[0], max[0], step, mesh.trim_uv.iter().map(|p| p[0]))?;
+        let us = tessellation_axis(min[0], max[0], step, trim_uv.iter().map(|p| p[0]))?;
         let vs = tessellation_axis(
             min[1],
             max[1],
             profile.max_v_edge,
-            mesh.trim_uv.iter().map(|p| p[1]),
+            trim_uv.iter().map(|p| p[1]),
         )?;
         let eval = Box::new(move |uv: [f64; 2]| {
             let (sn, cs) = uv[0].sin_cos();
@@ -541,6 +551,102 @@ fn tessellation_axis(
     ensure!(values.len() >= 2, "degenerate tessellation axis");
     Ok(values)
 }
+
+/// Read only the analytic cylinder and its primary trim for shared-edge
+/// refinement. Calling the full cylinder tessellator here needlessly
+/// triangulates the adjacent face once per shared edge.
+fn cylinder_refinement_data(
+    g: &ObjectGraph,
+    index: &PointerIndex<'_>,
+    fi: usize,
+) -> Result<(AnalyticCylinder, Vec<[f64; 2]>)> {
+    let face = g.objects.get(fi).context("face index")?;
+    ensure!(face.class_name == "Face", "not Face");
+    ensure!(
+        face.fields["m_faceRegions"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "face regions need subdivision"
+    );
+    let surface_index = index
+        .resolve(fi, &face.fields["m_pSurf"])?
+        .context("face surface")?;
+    let surface = &g.objects[surface_index];
+    ensure!(
+        surface.class_name == "CylSurf",
+        "unsupported adjacent surface"
+    );
+    let center = point::<3>(&surface.fields["m_center"])?;
+    let radius = surface.fields["m_radius"]
+        .as_f64()
+        .context("cylinder radius")?;
+    ensure!(radius.is_finite() && radius > 0., "invalid cylinder radius");
+    let x_vec = point::<3>(&surface.fields["m_xVec"])?;
+    let y_vec = point::<3>(&surface.fields["m_yVec"])?;
+    let z_vec = point::<3>(&surface.fields["m_zVec"])?;
+    let dot = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let norm = |a: [f64; 3]| dot(a, a).sqrt();
+    ensure!(
+        (norm(x_vec) - 1.).abs() < 1e-7
+            && (norm(y_vec) - 1.).abs() < 1e-7
+            && (norm(z_vec) - 1.).abs() < 1e-7,
+        "cylinder basis not unit"
+    );
+    ensure!(
+        dot(x_vec, y_vec).abs() < 1e-7
+            && dot(x_vec, z_vec).abs() < 1e-7
+            && dot(y_vec, z_vec).abs() < 1e-7,
+        "cylinder basis not orthogonal"
+    );
+    let cross_xy = [
+        x_vec[1] * y_vec[2] - x_vec[2] * y_vec[1],
+        x_vec[2] * y_vec[0] - x_vec[0] * y_vec[2],
+        x_vec[0] * y_vec[1] - x_vec[1] * y_vec[0],
+    ];
+    ensure!(
+        dot(cross_xy, z_vec) > 1. - 1e-7,
+        "left-handed cylinder basis"
+    );
+    let envelope = surface.fields["m_Envelope"]["m_corners"]
+        .as_array()
+        .context("cylinder envelope")?;
+    ensure!(envelope.len() == 2, "cylinder envelope bounds");
+    let u_range = [
+        envelope[0][0].as_f64().context("u min")?,
+        envelope[1][0].as_f64().context("u max")?,
+    ];
+    let v_range = [
+        envelope[0][1].as_f64().context("v min")?,
+        envelope[1][1].as_f64().context("v max")?,
+    ];
+    ensure!(
+        u_range.iter().chain(v_range.iter()).all(|v| v.is_finite())
+            && u_range[1] > u_range[0]
+            && u_range[1] - u_range[0] <= std::f64::consts::TAU + 1e-7
+            && v_range[1] > v_range[0],
+        "invalid cylinder envelope or seam crossing"
+    );
+    let loop_index = index
+        .resolve(fi, &face.fields["m_pFirstLoop"])?
+        .context("cylinder trim loop")?;
+    let trim_uv = ring(g, index, fi, loop_index)?;
+    ensure!(!trim_uv.is_empty(), "empty cylinder trim");
+    Ok((
+        AnalyticCylinder {
+            center,
+            radius,
+            x_vec,
+            y_vec,
+            z_vec,
+            orient_flag: surface.fields["m_orientFlag"]
+                .as_bool()
+                .context("cylinder orientation")?,
+            u_range,
+            v_range,
+        },
+        trim_uv,
+    ))
+}
 /// Returns no mesh for a face with no trimming boundary (an auxiliary surface).
 pub fn face(g: &ObjectGraph, fi: usize) -> Result<Option<FaceMesh>> {
     face_indexed(g, &PointerIndex::new(g), fi)
@@ -569,7 +675,10 @@ fn face_indexed(g: &ObjectGraph, index: &PointerIndex<'_>, fi: usize) -> Result<
             CylinderTessellationProfile::default(),
         )?));
     }
-    if matches!(p.class_name.as_str(), "SurfRev" | "RuledSurf") {
+    if matches!(
+        p.class_name.as_str(),
+        "ConeSurf" | "SurfRev" | "RuledSurf" | "HermiteSurf"
+    ) {
         return Ok(Some(crate::native_parametric_mesh::face(g, fi)?));
     }
     ensure!(
@@ -698,7 +807,7 @@ fn face_indexed(g: &ObjectGraph, index: &PointerIndex<'_>, fi: usize) -> Result<
     let vertex_count = vertices.len();
     Ok(Some(FaceMesh {
         face_index: fi,
-        face_tag: f.fields["m_GInfo"]["m_tag"].as_i64().unwrap_or(-1),
+        face_tag: face_tag(&f.fields)?,
         render_style_id: crate::native_metadata::identifier(&f.fields["m_renderStyleId"])
             .context("render style id")?,
         vertices,
@@ -712,6 +821,393 @@ fn face_indexed(g: &ObjectGraph, index: &PointerIndex<'_>, fi: usize) -> Result<
 
 /// Tessellate one Face whose saved surface is a bounded cylindrical surface.
 /// The analytic surface and UV trim are retained alongside the mesh.
+fn triangulate_trim_regions(
+    loops: &[Vec<[f64; 2]>],
+    u_range: [f64; 2],
+    v_range: [f64; 2],
+) -> Result<(Vec<[f64; 2]>, Vec<[u32; 3]>)> {
+    ensure!(
+        !loops.is_empty() && loops.len() <= 256,
+        "invalid trim regions"
+    );
+    let inside = |p: [f64; 2], ring: &[[f64; 2]]| -> bool {
+        let mut hit = false;
+        for (a, b) in ring
+            .iter()
+            .zip(ring.iter().cycle().skip(1))
+            .take(ring.len())
+        {
+            if point_on_segment(p, *a, *b, 1e-9) {
+                return false;
+            }
+            if (a[1] > p[1]) != (b[1] > p[1])
+                && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0]
+            {
+                hit = !hit;
+            }
+        }
+        hit
+    };
+    let proper_cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]| {
+        let ab = cross(a, b, c);
+        let ab2 = cross(a, b, d);
+        let cd = cross(c, d, a);
+        let cd2 = cross(c, d, b);
+        ab * ab2 < -1e-12 && cd * cd2 < -1e-12
+    };
+    let collinear_overlap = |a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]| {
+        if cross(a, b, c).abs() > 1e-9 || cross(a, b, d).abs() > 1e-9 {
+            return false;
+        }
+        let axis = if (b[0] - a[0]).abs() >= (b[1] - a[1]).abs() {
+            0
+        } else {
+            1
+        };
+        let left = a[axis].min(b[axis]).max(c[axis].min(d[axis]));
+        let right = a[axis].max(b[axis]).min(c[axis].max(d[axis]));
+        right - left > 1e-9
+    };
+    let mut normalized = loops.to_vec();
+    if u_range[1] - u_range[0] >= std::f64::consts::TAU - 1e-7 {
+        for ring in &mut normalized {
+            for i in 1..ring.len() {
+                ensure!(
+                    ring[i][0].is_finite() && ring[i][1].is_finite(),
+                    "nonfinite seam trim"
+                );
+                ensure!(
+                    ring[i][0].abs() <= 1e9,
+                    "seam trim exceeds coordinate budget"
+                );
+                while ring[i][0] - ring[i - 1][0] > std::f64::consts::PI {
+                    ring[i][0] -= std::f64::consts::TAU;
+                }
+                while ring[i][0] - ring[i - 1][0] < -std::f64::consts::PI {
+                    ring[i][0] += std::f64::consts::TAU;
+                }
+            }
+            let shift = ((u_range[0] - ring.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min))
+                / std::f64::consts::TAU)
+                .ceil();
+            if shift.is_finite() {
+                for p in &mut *ring {
+                    p[0] += shift * std::f64::consts::TAU;
+                }
+            }
+            let min_u = ring.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+            let max_u = ring.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max);
+            ensure!(
+                max_u - min_u <= std::f64::consts::TAU + 1e-7,
+                "trim spans more than one periodic cylinder turn"
+            );
+        }
+    }
+    let mut depths = Vec::with_capacity(normalized.len());
+    for (ring_index, ring) in normalized.iter().enumerate() {
+        ensure!(ring.len() >= 3, "trim ring has too few points");
+        for p in ring {
+            let u_in_envelope = if u_range[1] - u_range[0] >= std::f64::consts::TAU - 1e-7 {
+                p[0] >= u_range[0] - std::f64::consts::TAU - 1e-7
+                    && p[0] <= u_range[1] + std::f64::consts::TAU + 1e-7
+            } else {
+                p[0] >= u_range[0] - 1e-7 && p[0] <= u_range[1] + 1e-7
+            };
+            ensure!(
+                p[0].is_finite()
+                    && p[1].is_finite()
+                    && u_in_envelope
+                    && p[1] >= v_range[0] - 1e-7
+                    && p[1] <= v_range[1] + 1e-7,
+                "trim point outside envelope"
+            );
+        }
+        ensure!(area(ring).abs() > 1e-12, "degenerate trim ring");
+        for (i, a) in ring.iter().enumerate() {
+            let b = ring[(i + 1) % ring.len()];
+            for (j, c) in ring.iter().enumerate().skip(i + 1) {
+                if j == i + 1 || (i == 0 && j + 1 == ring.len()) {
+                    continue;
+                }
+                let d = ring[(j + 1) % ring.len()];
+                ensure!(!proper_cross(*a, b, *c, d), "crossing trim edges");
+                ensure!(
+                    !point_on_segment(*a, *c, d, 1e-9)
+                        && !point_on_segment(b, *c, d, 1e-9)
+                        && !point_on_segment(*c, *a, b, 1e-9)
+                        && !point_on_segment(d, *a, b, 1e-9),
+                    "self-touching trim ring"
+                );
+            }
+        }
+        depths.push(
+            normalized
+                .iter()
+                .enumerate()
+                .filter(|(i, other)| *i != ring_index && inside(ring[0], other))
+                .count(),
+        );
+    }
+    for (i, first) in normalized.iter().enumerate() {
+        for second in normalized.iter().skip(i + 1) {
+            let mut touches = false;
+            for (a, b) in first
+                .iter()
+                .zip(first.iter().cycle().skip(1))
+                .take(first.len())
+            {
+                for (c, d) in second
+                    .iter()
+                    .zip(second.iter().cycle().skip(1))
+                    .take(second.len())
+                {
+                    ensure!(!proper_cross(*a, *b, *c, *d), "crossing trim regions");
+                    ensure!(
+                        !collinear_overlap(*a, *b, *c, *d),
+                        "overlapping trim regions"
+                    );
+                    touches |= point_on_segment(*a, *c, *d, 1e-9)
+                        || point_on_segment(*b, *c, *d, 1e-9)
+                        || point_on_segment(*c, *a, *b, 1e-9)
+                        || point_on_segment(*d, *a, *b, 1e-9);
+                }
+            }
+            if touches {
+                let first_inside_second = first.iter().any(|p| inside(*p, second));
+                let second_inside_first = second.iter().any(|p| inside(*p, first));
+                ensure!(
+                    !first_inside_second && !second_inside_first,
+                    "ambiguous nested touching trim regions"
+                );
+            }
+        }
+    }
+    let expected_area: f64 = normalized
+        .iter()
+        .enumerate()
+        .map(|(i, ring)| {
+            if depths[i] % 2 == 0 {
+                area(ring).abs()
+            } else {
+                -area(ring).abs()
+            }
+        })
+        .sum();
+    ensure!(expected_area > 1e-12, "trim regions have no supported area");
+    let mut vertices = Vec::new();
+    let mut triangles = Vec::new();
+    for (outer_i, outer) in normalized
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| depths[*i] % 2 == 0)
+    {
+        let mut points = outer.clone();
+        let mut holes = Vec::new();
+        for (i, hole) in normalized.iter().enumerate() {
+            if depths[i] == depths[outer_i] + 1 && inside(hole[0], outer) {
+                holes.push(points.len() as u32);
+                points.extend_from_slice(hole);
+            }
+        }
+        let base = vertices.len() as u32;
+        let mut local = Vec::new();
+        earcut::Earcut::new().earcut(points.iter().copied(), &holes, &mut local);
+        ensure!(
+            !local.is_empty() && local.len() % 3 == 0,
+            "trim region triangulation failed"
+        );
+        vertices.extend(points);
+        triangles.extend(
+            local
+                .chunks_exact(3)
+                .map(|t| [base + t[0], base + t[1], base + t[2]]),
+        );
+    }
+    ensure!(
+        vertices.len() <= 2_000_000 && triangles.len() <= 4_000_000,
+        "trim tessellation budget exceeded"
+    );
+    let actual_area: f64 = triangles
+        .iter()
+        .map(|t| {
+            area(&[
+                vertices[t[0] as usize],
+                vertices[t[1] as usize],
+                vertices[t[2] as usize],
+            ])
+            .abs()
+        })
+        .sum();
+    ensure!(
+        (actual_area - expected_area).abs() <= 1e-7 * expected_area.max(1.),
+        "trim triangulated area mismatch: {actual_area} vs {expected_area}"
+    );
+    Ok((vertices, triangles))
+}
+
+fn original_refine_vertex(
+    index: u32,
+    points: &[[f64; 2]],
+    vertices: &mut Vec<[f64; 2]>,
+    map: &mut BTreeMap<u32, u32>,
+) -> u32 {
+    if let Some(&value) = map.get(&index) {
+        return value;
+    }
+    let value = vertices.len() as u32;
+    vertices.push(points[index as usize]);
+    map.insert(index, value);
+    value
+}
+
+fn edge_refine_vertex(
+    a: u32,
+    b: u32,
+    k: usize,
+    n: usize,
+    points: &[[f64; 2]],
+    vertices: &mut Vec<[f64; 2]>,
+    originals: &mut BTreeMap<u32, u32>,
+    edges: &mut BTreeMap<(u32, u32, usize), u32>,
+) -> u32 {
+    if k == 0 {
+        return original_refine_vertex(a, points, vertices, originals);
+    }
+    if k == n {
+        return original_refine_vertex(b, points, vertices, originals);
+    }
+    let (lo, hi, step) = if a <= b { (a, b, k) } else { (b, a, n - k) };
+    if let Some(&value) = edges.get(&(lo, hi, step)) {
+        return value;
+    }
+    let t = step as f64 / n as f64;
+    let p = points[lo as usize];
+    let q = points[hi as usize];
+    let value = vertices.len() as u32;
+    vertices.push([p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])]);
+    edges.insert((lo, hi, step), value);
+    value
+}
+
+fn refine_uv_triangles(
+    points: &[[f64; 2]],
+    triangles: &[[u32; 3]],
+    max_u: f64,
+    max_v: f64,
+) -> Result<(Vec<[f64; 2]>, Vec<[u32; 3]>)> {
+    ensure!(
+        !points.is_empty() && !triangles.is_empty(),
+        "empty trim triangulation"
+    );
+    let mut n = 1usize;
+    for tri in triangles {
+        ensure!(
+            tri.iter().all(|i| (*i as usize) < points.len()),
+            "trim triangle index out of bounds"
+        );
+        let a = points[tri[0] as usize];
+        let b = points[tri[1] as usize];
+        let c = points[tri[2] as usize];
+        let required = ((a[0] - b[0])
+            .abs()
+            .max((b[0] - c[0]).abs())
+            .max((c[0] - a[0]).abs())
+            / max_u)
+            .ceil()
+            .max(
+                ((a[1] - b[1])
+                    .abs()
+                    .max((b[1] - c[1]).abs())
+                    .max((c[1] - a[1]).abs())
+                    / max_v)
+                    .ceil(),
+            ) as usize;
+        n = n.max(required);
+    }
+    ensure!(n <= 4096, "trim interior refinement budget exceeded");
+    let point_budget = (triangles.len() as u128) * ((n as u128 + 1) * (n as u128 + 2) / 2);
+    let triangle_budget = (triangles.len() as u128) * n as u128 * n as u128;
+    ensure!(
+        point_budget <= 2_000_000 && triangle_budget <= 4_000_000,
+        "trim refinement resource budget exceeded"
+    );
+    let mut out_points = Vec::new();
+    let mut out_triangles = Vec::new();
+    let mut originals = BTreeMap::new();
+    let mut edges = BTreeMap::new();
+    for tri in triangles {
+        let a = points[tri[0] as usize];
+        let b = points[tri[1] as usize];
+        let c = points[tri[2] as usize];
+        let mut local = vec![0u32; (n + 1) * (n + 2) / 2];
+        let row = |i: usize| -> usize { i * (2 * n - i + 3) / 2 };
+        for i in 0..=n {
+            for j in 0..=n - i {
+                let index = row(i) + j;
+                local[index] = if j == 0 {
+                    edge_refine_vertex(
+                        tri[0],
+                        tri[1],
+                        i,
+                        n,
+                        points,
+                        &mut out_points,
+                        &mut originals,
+                        &mut edges,
+                    )
+                } else if i == 0 {
+                    edge_refine_vertex(
+                        tri[0],
+                        tri[2],
+                        j,
+                        n,
+                        points,
+                        &mut out_points,
+                        &mut originals,
+                        &mut edges,
+                    )
+                } else if i + j == n {
+                    edge_refine_vertex(
+                        tri[1],
+                        tri[2],
+                        j,
+                        n,
+                        points,
+                        &mut out_points,
+                        &mut originals,
+                        &mut edges,
+                    )
+                } else {
+                    let u = i as f64 / n as f64;
+                    let v = j as f64 / n as f64;
+                    let value = out_points.len() as u32;
+                    out_points.push([
+                        a[0] + u * (b[0] - a[0]) + v * (c[0] - a[0]),
+                        a[1] + u * (b[1] - a[1]) + v * (c[1] - a[1]),
+                    ]);
+                    value
+                };
+            }
+        }
+        for i in 0..n {
+            for j in 0..n - i {
+                let p = local[row(i) + j];
+                let q = local[row(i + 1) + j];
+                let r = local[row(i) + j + 1];
+                out_triangles.push([p, q, r]);
+                if j < n - i - 1 {
+                    out_triangles.push([r, q, local[row(i + 1) + j + 1]]);
+                }
+            }
+        }
+    }
+    ensure!(
+        out_points.len() <= 2_000_000 && out_triangles.len() <= 4_000_000,
+        "trim refinement resource budget exceeded"
+    );
+    Ok((out_points, out_triangles))
+}
+
 pub fn cylinder_face(
     g: &ObjectGraph,
     fi: usize,
@@ -799,14 +1295,18 @@ pub fn cylinder_face(
     let loop_index = index
         .resolve(fi, &face.fields["m_pFirstLoop"])?
         .context("cylinder trim loop")?;
-    ensure!(
-        index
-            .resolve(loop_index, &g.objects[loop_index].fields["m_nextLoop"])?
-            .is_none(),
-        "multiple cylinder trim loops unsupported"
-    );
     let trim_uv = ring(g, &index, fi, loop_index)?;
     ensure!(!trim_uv.is_empty(), "empty cylinder trim");
+    let mut trim_loops = vec![trim_uv.clone()];
+    let mut next_loop = index.resolve(loop_index, &g.objects[loop_index].fields["m_nextLoop"])?;
+    while let Some(li) = next_loop {
+        trim_loops.push(ring(g, &index, fi, li)?);
+        next_loop = index.resolve(li, &g.objects[li].fields["m_nextLoop"])?;
+        ensure!(
+            trim_loops.len() <= 256,
+            "cylinder trim loop budget exceeded"
+        );
+    }
     let mut trim_min = [f64::INFINITY; 2];
     let mut trim_max = [f64::NEG_INFINITY; 2];
     for uv in &trim_uv {
@@ -820,7 +1320,128 @@ pub fn cylinder_face(
         "degenerate cylinder trim"
     );
     let tol = 1e-7;
-    ensure!(trim_uv.len() >= 4, "nonrectangular cylinder trim");
+    let rectangular = trim_loops.len() == 1
+        && trim_uv.len() >= 4
+        && trim_uv
+            .iter()
+            .zip(trim_uv.iter().cycle().skip(1))
+            .take(trim_uv.len())
+            .all(|(a, b)| {
+                let du = (b[0] - a[0]).abs();
+                let dv = (b[1] - a[1]).abs();
+                du < tol || dv < tol
+            });
+    if !rectangular {
+        let sagitta_ratio = (profile.chord_error / (2. * radius)).min(1.);
+        let angular_step = (4. * sagitta_ratio.sqrt().asin()).min(std::f64::consts::FRAC_PI_2);
+        ensure!(
+            angular_step.is_finite() && angular_step > 0.,
+            "cylinder tessellation precision underflow"
+        );
+        let sampled_loops = trim_loops
+            .iter()
+            .map(|loop_points| {
+                let mut sampled = Vec::new();
+                let mut a = loop_points[0];
+                for index in 0..loop_points.len() {
+                    let mut b = loop_points[(index + 1) % loop_points.len()];
+                    if u_range[1] - u_range[0] >= std::f64::consts::TAU - 1e-7 {
+                        while b[0] - a[0] > std::f64::consts::PI {
+                            b[0] -= std::f64::consts::TAU;
+                        }
+                        while b[0] - a[0] < -std::f64::consts::PI {
+                            b[0] += std::f64::consts::TAU;
+                        }
+                    }
+                    let count = ((b[0] - a[0]).abs() / angular_step)
+                        .ceil()
+                        .max((b[1] - a[1]).abs() / profile.max_v_edge)
+                        .ceil() as usize;
+                    ensure!(
+                        count > 0 && count <= 100_000,
+                        "trim edge subdivision budget exceeded"
+                    );
+                    for i in 0..count {
+                        let t = i as f64 / count as f64;
+                        sampled.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+                    }
+                    a = b;
+                }
+                Ok(sampled)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (uv_vertices, triangles) = triangulate_trim_regions(&sampled_loops, u_range, v_range)?;
+        let (uv_vertices, mut triangles) =
+            refine_uv_triangles(&uv_vertices, &triangles, angular_step, profile.max_v_edge)?;
+        let orient = surface.fields["m_orientFlag"]
+            .as_bool()
+            .context("cylinder orientation")?
+            ^ (face.fields["m_faceFlags_v9"]
+                .as_u64()
+                .context("face flags")?
+                & 2
+                != 0);
+        let eval = |u: f64, v: f64| {
+            let (s, c) = u.sin_cos();
+            [
+                center[0] + radius * (c * x_vec[0] + s * y_vec[0]) + v * z_vec[0],
+                center[1] + radius * (c * x_vec[1] + s * y_vec[1]) + v * z_vec[1],
+                center[2] + radius * (c * x_vec[2] + s * y_vec[2]) + v * z_vec[2],
+            ]
+        };
+        let vertices = uv_vertices
+            .iter()
+            .map(|p| eval(p[0], p[1]))
+            .collect::<Vec<_>>();
+        let normals = uv_vertices
+            .iter()
+            .map(|p| {
+                let (s, c) = p[0].sin_cos();
+                let n = [
+                    c * x_vec[0] + s * y_vec[0],
+                    c * x_vec[1] + s * y_vec[1],
+                    c * x_vec[2] + s * y_vec[2],
+                ];
+                if orient { n } else { [-n[0], -n[1], -n[2]] }
+            })
+            .collect::<Vec<_>>();
+        for triangle in &mut triangles {
+            let a = vertices[triangle[0] as usize];
+            let b = vertices[triangle[1] as usize];
+            let c = vertices[triangle[2] as usize];
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let cross = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            let n = normals[triangle[0] as usize];
+            if cross.iter().zip(n).map(|(x, y)| x * y).sum::<f64>() < 0. {
+                triangle.swap(1, 2);
+            }
+        }
+        return Ok(FaceMesh {
+            face_index: fi,
+            face_tag: face_tag(&face.fields)?,
+            render_style_id: crate::native_metadata::identifier(&face.fields["m_renderStyleId"])?,
+            vertices,
+            triangles,
+            normal: normals[0],
+            normals,
+            analytic_surface: Some(AnalyticCylinder {
+                center,
+                radius,
+                x_vec,
+                y_vec,
+                z_vec,
+                orient_flag: orient,
+                u_range,
+                v_range,
+            }),
+            trim_uv,
+        });
+    }
     let mut covered = [0.; 4];
     let mut perimeter = 0.;
     for (a, b) in trim_uv
@@ -964,7 +1585,7 @@ pub fn cylinder_face(
     }
     Ok(FaceMesh {
         face_index: fi,
-        face_tag: face.fields["m_GInfo"]["m_tag"].as_i64().unwrap_or(-1),
+        face_tag: face_tag(&face.fields)?,
         render_style_id: crate::native_metadata::identifier(&face.fields["m_renderStyleId"])?,
         vertices,
         triangles,
@@ -994,7 +1615,7 @@ pub struct Primitive {
     pub normals: Vec<[f64; 3]>,
     pub triangles: Vec<[u32; 3]>,
 }
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GraphicsMeshes {
     pub primitives: Vec<Primitive>,
     pub diagnostics: Vec<String>,
@@ -1010,6 +1631,73 @@ pub struct GraphicsMeshes {
     pub excluded_non_surface_branches: usize,
     #[serde(default)]
     pub profile_observations: Vec<String>,
+}
+
+/// Convert a triangle list with per-face normals to an indexed
+/// position/normal mesh. A vertex is split only when its normal differs,
+/// preserving sharp edges while retaining all possible sharing.
+fn reindex_mesh(
+    vertices: &[[f64; 3]],
+    normals: &[[f64; 3]],
+    triangles: &[[u32; 3]],
+) -> Result<(Vec<[f64; 3]>, Vec<[f64; 3]>, Vec<[u32; 3]>)> {
+    ensure!(
+        normals.is_empty() || normals.len() == triangles.len(),
+        "unsupported normal cardinality"
+    );
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    struct VertexKey {
+        position: [u64; 3],
+        normal: [u64; 3],
+    }
+    let mut positions = Vec::new();
+    let mut output_normals = Vec::new();
+    let mut output_triangles = Vec::with_capacity(triangles.len());
+    let mut known = BTreeMap::<VertexKey, u32>::new();
+    for (triangle_index, triangle) in triangles.iter().enumerate() {
+        let face_normal = if normals.is_empty() {
+            let a = *vertices
+                .get(usize::try_from(triangle[0])?)
+                .context("triangle vertex index")?;
+            let b = *vertices
+                .get(usize::try_from(triangle[1])?)
+                .context("triangle vertex index")?;
+            let c = *vertices
+                .get(usize::try_from(triangle[2])?)
+                .context("triangle vertex index")?;
+            let u: [f64; 3] = std::array::from_fn(|k| b[k] - a[k]);
+            let v: [f64; 3] = std::array::from_fn(|k| c[k] - a[k]);
+            [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ]
+        } else {
+            normals[triangle_index]
+        };
+        let mut output = [0_u32; 3];
+        for (corner, source_index) in triangle.iter().copied().enumerate() {
+            let position = *vertices
+                .get(usize::try_from(source_index)?)
+                .context("triangle vertex index")?;
+            let key = VertexKey {
+                position: position.map(f64::to_bits),
+                normal: face_normal.map(f64::to_bits),
+            };
+            let index = if let Some(index) = known.get(&key) {
+                *index
+            } else {
+                let index = u32::try_from(positions.len())?;
+                positions.push(position);
+                output_normals.push(face_normal);
+                known.insert(key, index);
+                index
+            };
+            output[corner] = index;
+        }
+        output_triangles.push(output);
+    }
+    Ok((positions, output_normals, output_triangles))
 }
 /// Decode selected saved graphics. Positions and normals are in the owning
 /// document frame; length units remain Revit internal feet.
@@ -1139,43 +1827,11 @@ pub fn graphics_with_resolver_at_detail<'a>(
                         Ok(t)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                ensure!(
-                    normals.is_empty() || normals.len() == triangles.len(),
-                    "unsupported normal cardinality"
-                );
-                let facet_normals = !normals.is_empty();
-
-                let mut expanded_vertices = Vec::new();
-                let mut expanded_normals = Vec::new();
-                let mut expanded_triangles = Vec::new();
-                for (i, t) in triangles.iter().enumerate() {
-                    let base = expanded_vertices.len() as u32;
-                    let normal = if facet_normals {
-                        normals[i]
-                    } else {
-                        let a = vertices[t[0] as usize];
-                        let b = vertices[t[1] as usize];
-                        let c = vertices[t[2] as usize];
-                        let u: [f64; 3] = std::array::from_fn(|k| b[k] - a[k]);
-                        let v: [f64; 3] = std::array::from_fn(|k| c[k] - a[k]);
-                        [
-                            u[1] * v[2] - u[2] * v[1],
-                            u[2] * v[0] - u[0] * v[2],
-                            u[0] * v[1] - u[1] * v[0],
-                        ]
-                    };
-                    for idx in t {
-                        expanded_vertices.push(vertices[*idx as usize]);
-                        expanded_normals.push(normal);
-                    }
-                    expanded_triangles.push([base, base + 1, base + 2]);
-                }
-                let (vertices, normals, triangles) =
-                    (expanded_vertices, expanded_normals, expanded_triangles);
+                let (vertices, normals, triangles) = reindex_mesh(&vertices, &normals, &triangles)?;
                 decoded.push(Primitive {
                     source_owner_id: selected.source_owner_id,
                     object_index: oi,
-                    face_tag: obj.fields["m_GInfo"]["m_tag"].as_i64().unwrap_or(-1),
+                    face_tag: face_tag(&obj.fields)?,
                     render_style_id: crate::native_metadata::identifier(
                         &obj.fields["m_interiorGStyleID"],
                     )
@@ -1202,6 +1858,89 @@ pub fn graphics_with_resolver_at_detail<'a>(
     }
     out
 }
+
+/// Collect the saved material/style records needed by a graphics package
+/// without tessellating any faces.  Rich delivery uses this before the actual
+/// mesh pass; keeping dependency discovery separate avoids doing the expensive
+/// BRep triangulation twice for every selected owner.
+pub fn material_dependency_ids_with_resolver_at_detail<'a>(
+    g: &'a ObjectGraph,
+    resolver: &dyn Fn(u64) -> Option<&'a ObjectGraph>,
+    detail_level: i64,
+) -> (BTreeSet<u64>, Vec<String>) {
+    let selection = crate::native_graphics_traversal::select_graphics_with_resolver_at_detail(
+        g,
+        resolver,
+        detail_level,
+    );
+    let mut ids = BTreeSet::new();
+    let mut diagnostics = selection
+        .diagnostics
+        .iter()
+        .map(|d| format!("object {}: {}", d.object_index, d.message))
+        .collect::<Vec<_>>();
+    let mut pointer_indices = BTreeMap::new();
+    for selected in selection.selected {
+        let graph = match selected.source_owner_id {
+            None => g,
+            Some(id) => match resolver(id) {
+                Some(graph) => graph,
+                None => {
+                    diagnostics.push(format!("resolved graphics owner {id} disappeared"));
+                    continue;
+                }
+            },
+        };
+        let index = pointer_indices
+            .entry(selected.source_owner_id)
+            .or_insert_with(|| PointerIndex::new(graph));
+        let object = &graph.objects[selected.object_index];
+        let result = (|| -> Result<()> {
+            match object.class_name.as_str() {
+                "Geometry" => {
+                    for pointer in object.fields["m_pFaces"]
+                        .as_array()
+                        .context("geometry faces")?
+                    {
+                        let face = index
+                            .resolve(selected.object_index, pointer)?
+                            .context("null geometry face")?;
+                        let face_object = graph.objects.get(face).context("face index")?;
+                        ensure!(face_object.class_name == "Face", "not Face");
+                        let style = crate::native_metadata::identifier(
+                            &face_object.fields["m_renderStyleId"],
+                        )?;
+                        if style > 0 {
+                            ids.insert(style as u64);
+                        }
+                    }
+                }
+                "GPolyMesh" => {
+                    for (field, label) in [
+                        ("m_materialID", "polymesh material"),
+                        ("m_interiorGStyleID", "polymesh style"),
+                    ] {
+                        let id = crate::native_metadata::identifier(&object.fields[field])
+                            .with_context(|| label.to_string())?;
+                        if id > 0 {
+                            ids.insert(id as u64);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if let Some(owner) = selected.source_owner_id {
+                ids.insert(owner);
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            diagnostics.push(format!("object {}: {error:#}", selected.object_index));
+        }
+    }
+    (ids, diagnostics)
+}
+
 fn transform(p: &mut Primitive, m: [[f64; 4]; 4]) -> Result<()> {
     let a = [m[0][0], m[1][0], m[2][0]];
     let b = [m[0][1], m[1][1], m[2][1]];
@@ -1249,6 +1988,52 @@ fn transform(p: &mut Primitive, m: [[f64; 4]; 4]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::native_parameters::{GraphEdge, GraphObject};
+
+    #[test]
+    fn reindex_mesh_shares_corners_with_equal_normals() {
+        let vertices = vec![[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]];
+        let normals = vec![[0., 0., 1.], [0., 0., 1.]];
+        let triangles = vec![[0, 1, 2], [0, 2, 3]];
+        let (positions, output_normals, output_triangles) =
+            reindex_mesh(&vertices, &normals, &triangles).unwrap();
+        assert_eq!(positions.len(), 4);
+        assert_eq!(output_normals.len(), 4);
+        assert_eq!(output_triangles, vec![[0, 1, 2], [0, 2, 3]]);
+    }
+
+    #[test]
+    fn reindex_mesh_splits_only_normal_discontinuities() {
+        let vertices = vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
+        let normals = vec![[0., 0., 1.], [0., 1., 0.]];
+        let triangles = vec![[0, 1, 2], [0, 3, 1]];
+        let (positions, output_normals, _) = reindex_mesh(&vertices, &normals, &triangles).unwrap();
+        assert_eq!(positions.len(), 6);
+        assert_eq!(output_normals.len(), 6);
+    }
+
+    #[test]
+    fn material_dependency_walk_reads_polymesh_ids_without_tessellation() {
+        let graph = ObjectGraph {
+            consumed_bytes: 0,
+            objects: vec![GraphObject {
+                class_tag: 1,
+                class_name: "GPolyMesh".into(),
+                token: 1,
+                start: 0,
+                fields_end: 0,
+                fields: serde_json::json!({
+                    "m_materialID": 41,
+                    "m_interiorGStyleID": 73
+                }),
+            }],
+            edges: vec![],
+        };
+        let (ids, diagnostics) =
+            material_dependency_ids_with_resolver_at_detail(&graph, &|_| None, 3);
+        assert_eq!(ids, BTreeSet::from([41, 73]));
+        assert!(diagnostics.is_empty());
+    }
+
     fn cylinder_graph(radius: f64, nonrectangular_trim: bool) -> ObjectGraph {
         cylinder_graph_with_points(
             radius,
@@ -1713,20 +2498,71 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_cylsurf_nonrectangular_trim_is_refused() {
+    fn synthetic_cylsurf_nonrectangular_trim_is_tessellated() {
         let graph = cylinder_graph(0.5, true);
         let direct = cylinder_face(&graph, 2, CylinderTessellationProfile::default());
-        assert!(direct.is_err(), "direct result: {:?}", direct);
+        assert!(direct.is_ok(), "direct result: {:?}", direct);
         let result = graphics(&graph);
-        assert_eq!(result.primitives.len(), 0, "{:?}", result.diagnostics);
+        assert_eq!(result.primitives.len(), 1, "{:?}", result.diagnostics);
+        assert!(!result.primitives[0].triangles.is_empty());
+    }
+
+    fn uv_area(points: &[[f64; 2]], triangles: &[[u32; 3]]) -> f64 {
+        triangles
+            .iter()
+            .map(|t| {
+                let a = points[t[0] as usize];
+                let b = points[t[1] as usize];
+                let c = points[t[2] as usize];
+                ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.
+            })
+            .sum()
+    }
+
+    #[test]
+    fn sampled_trim_regions_support_slants_holes_islands_and_ring_permutation() {
+        let outer = vec![[0., 0.], [6., 0.], [6., 6.], [0., 6.]];
+        let hole = vec![[1., 1.], [1., 5.], [5., 5.], [5., 1.]];
+        let island = vec![[2., 2.], [4., 2.], [4., 4.], [2., 4.]];
+        let slant = vec![[0., 0.], [3., 0.], [2., 2.], [0., 1.]];
+        let (points, triangles) = triangulate_trim_regions(
+            &[island.clone(), outer.clone(), hole.clone()],
+            [0., 6.],
+            [0., 6.],
+        )
+        .unwrap();
+        assert!(!triangles.is_empty());
+        assert!((uv_area(&points, &triangles) - 24.).abs() < 1e-9);
+        let (slant_points, slant_triangles) =
+            triangulate_trim_regions(&[slant], [0., 3.], [0., 2.]).unwrap();
+        assert!((uv_area(&slant_points, &slant_triangles) - 4.).abs() < 1e-9);
         assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|d| d.contains("nonrectangular cylinder trim")),
-            "{:?}",
-            result.diagnostics
+            triangulate_trim_regions(
+                &[vec![[0., 0.], [3., 3.], [0., 3.], [3., 0.]]],
+                [0., 6.],
+                [0., 6.]
+            )
+            .is_err()
         );
+    }
+
+    #[test]
+    fn sampled_trim_regions_normalize_periodic_seam_and_reject_point_touch() {
+        let seam = vec![[6.0, 0.0], [6.25, 0.0], [6.25, 2.0], [6.0, 2.0]];
+        let (points, triangles) =
+            triangulate_trim_regions(&[seam], [0., std::f64::consts::TAU], [0., 2.]).unwrap();
+        assert!(!triangles.is_empty() && uv_area(&points, &triangles) > 0.);
+        let crossing = vec![[6.2, 0.0], [0.1, 0.0], [0.1, 2.0], [6.2, 2.0]];
+        let (points, triangles) =
+            triangulate_trim_regions(&[crossing], [0., std::f64::consts::TAU], [0., 2.]).unwrap();
+        let expected = (0.1 + std::f64::consts::TAU - 6.2) * 2.;
+        assert!((uv_area(&points, &triangles) - expected).abs() < 1e-9);
+        let touching = [
+            vec![[0., 0.], [2., 0.], [2., 2.], [0., 2.]],
+            vec![[2., 2.], [4., 2.], [4., 4.], [2., 4.]],
+        ];
+        let touching_result = triangulate_trim_regions(&touching, [0., 4.], [0., 4.]);
+        assert!(touching_result.is_ok(), "{touching_result:?}");
     }
 
     #[test]
@@ -1840,7 +2676,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_cylsurf_second_trim_loop_is_refused() {
+    fn synthetic_cylsurf_malformed_second_trim_loop_is_refused_explicitly() {
         let mut graph = cylinder_graph(0.5, false);
         let second_loop = graph.objects[4].clone();
         let second_index = graph.objects.len();
@@ -1857,7 +2693,43 @@ mod tests {
             target_class_tag: 14,
         });
         let error = cylinder_face(&graph, 2, CylinderTessellationProfile::default()).unwrap_err();
-        assert!(error.to_string().contains("multiple cylinder trim loops"));
+        assert!(error.to_string().contains("nonedge loop member"), "{error}");
+    }
+
+    #[test]
+    fn refined_trim_shares_edges_between_adjacent_triangles() {
+        let points = vec![[0., 0.], [4., 0.], [4., 4.], [0., 4.]];
+        let triangles = vec![[0, 1, 2], [0, 2, 3]];
+        let (refined, refined_triangles) =
+            refine_uv_triangles(&points, &triangles, 1., 1.).unwrap();
+        let mut edges = BTreeMap::<(u32, u32), usize>::new();
+        for triangle in &refined_triangles {
+            for edge in 0..3 {
+                let key = (
+                    triangle[edge].min(triangle[(edge + 1) % 3]),
+                    triangle[edge].max(triangle[(edge + 1) % 3]),
+                );
+                *edges.entry(key).or_default() += 1;
+            }
+        }
+        assert!(
+            edges.values().any(|count| *count == 2),
+            "no shared interior edge: {edges:?}"
+        );
+        assert!(refined_triangles.iter().all(|triangle| {
+            let a = refined[triangle[0] as usize];
+            let b = refined[triangle[1] as usize];
+            let c = refined[triangle[2] as usize];
+            cross(a, b, c).abs() > 1e-12
+        }));
+    }
+
+    #[test]
+    fn missing_face_tag_is_refused_instead_of_using_sentinel_identity() {
+        let mut graph = cylinder_graph(0.5, false);
+        graph.objects[2].fields["m_GInfo"] = serde_json::json!({});
+        let error = cylinder_face(&graph, 2, CylinderTessellationProfile::default()).unwrap_err();
+        assert!(error.to_string().contains("face tag"), "{error}");
     }
 
     #[test]

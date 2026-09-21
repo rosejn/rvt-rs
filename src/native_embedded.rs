@@ -298,13 +298,12 @@ pub fn scan_current_with_options(
         &registry,
         options.max_graph_values,
     )?;
-    let mut counts = BTreeMap::new();
-    scan_with_options(file, options, |record| {
-        *counts
-            .entry((record.content_key_raw_hex, record.local_element_id))
-            .or_insert(0usize) += 1;
-        Ok(())
-    })?;
+    // Current-state qualification only needs to know whether a content-local
+    // locator has exactly one physical candidate. Decoding every graph for a
+    // first counting pass doubled the work and temporarily materialized large
+    // graphs that were immediately discarded. Count validated channel-102
+    // record rows directly, then decode once in the emitting pass below.
+    let counts = count_physical_candidates(file, options, &registry)?;
     let mut selected = 0usize;
     let mut summary = scan_with_options(file, options, |mut record| {
         let candidates = counts
@@ -340,6 +339,46 @@ pub fn scan_current_with_options(
     summary.selected_current_records = selected;
     summary.content_catalog = Some(catalog);
     Ok(summary)
+}
+
+fn count_physical_candidates(
+    file: &mut RevitFile,
+    options: &ScanOptions,
+    registry: &schema_registry::Registry,
+) -> Result<BTreeMap<(String, u64), usize>> {
+    let mut names: Vec<_> = file
+        .stream_names()
+        .iter()
+        .filter(|n| n.starts_with("Partitions/"))
+        .cloned()
+        .collect();
+    names.sort();
+    let mut counts = BTreeMap::new();
+    for name in names {
+        let stored = file.read_stream_with_limit(&name, options.max_stream_bytes)?;
+        let prepared = compression::prepare_stream_for_inflate(&name, &stored);
+        native_segments::walk(
+            &prepared,
+            registry,
+            options.max_group_bytes,
+            |source, bytes| {
+                let Some(key) = source.content_key else {
+                    return Ok(());
+                };
+                if source.channel != 102 {
+                    return Ok(());
+                }
+                for (id, _offset, _start, _end) in rows(bytes, source)? {
+                    if id != u64::MAX {
+                        let key: String = key.iter().map(|b| format!("{b:02x}")).collect();
+                        *counts.entry((key, id)).or_insert(0usize) += 1;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(counts)
 }
 
 fn selection_for(

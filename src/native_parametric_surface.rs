@@ -116,6 +116,34 @@ pub enum Curve {
         radius: f64,
         range: [f64; 2],
     },
+    Ellipse {
+        center: Point,
+        x: Point,
+        y: Point,
+        x_len: f64,
+        y_len: f64,
+        range: [f64; 2],
+    },
+    HermiteSpline {
+        nodes: Vec<HermiteNode>,
+        range: [f64; 2],
+        periodic: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct HermiteNode {
+    parameter: f64,
+    point: Point,
+    tangent: Point,
+}
+
+#[derive(Debug, Clone)]
+pub struct HermiteSurfaceNode {
+    point: Point,
+    u_tangent: Point,
+    v_tangent: Point,
+    mixed_derivative: Point,
 }
 
 impl Curve {
@@ -158,6 +186,75 @@ impl Curve {
                     range: range(&o.fields["m_endParams"], "arc range")?,
                 })
             }
+            "GEllipse" => {
+                let x = p(&o.fields["m_xVec"], "ellipse x basis")?;
+                let y = p(&o.fields["m_yVec"], "ellipse y basis")?;
+                let x_len = o.fields["m_xLen"].as_f64().context("ellipse x length")?;
+                let y_len = o.fields["m_yLen"].as_f64().context("ellipse y length")?;
+                ensure!(
+                    x_len.is_finite()
+                        && y_len.is_finite()
+                        && x_len > 0.
+                        && y_len > 0.
+                        && (len(x) - 1.).abs() <= 1e-6
+                        && (len(y) - 1.).abs() <= 1e-6
+                        && dot(x, y).abs() <= 1e-6,
+                    "invalid ellipse basis"
+                );
+                Ok(Self::Ellipse {
+                    center: p(&o.fields["m_center"], "ellipse center")?,
+                    x,
+                    y,
+                    x_len,
+                    y_len,
+                    range: range(&o.fields["m_endParams"], "ellipse range")?,
+                })
+            }
+            "GHermiteSpline" => {
+                let periodic = o.fields["m_Periodic"]
+                    .as_bool()
+                    .context("Hermite spline periodic flag")?;
+                let range = range(&o.fields["m_endParams"], "Hermite spline range")?;
+                let values = o.fields["m_NodeArray"]
+                    .as_array()
+                    .context("Hermite spline nodes")?;
+                ensure!(values.len() >= 2, "Hermite spline needs two nodes");
+                let mut nodes = Vec::with_capacity(values.len());
+                for value in values {
+                    let parameter = value["m_iParametr"]
+                        .as_f64()
+                        .context("Hermite node parameter")?;
+                    ensure!(parameter.is_finite(), "nonfinite Hermite node parameter");
+                    nodes.push(HermiteNode {
+                        parameter,
+                        point: p(&value["m_iPoint"], "Hermite node point")?,
+                        tangent: p(&value["m_iTangent"], "Hermite node tangent")?,
+                    });
+                }
+                ensure!(
+                    nodes
+                        .windows(2)
+                        .all(|pair| pair[1].parameter > pair[0].parameter),
+                    "Hermite node parameters are not ordered"
+                );
+                ensure!(
+                    (nodes[0].parameter - range[0]).abs() <= 1e-7,
+                    "Hermite node range does not match start parameter"
+                );
+                ensure!(
+                    if periodic {
+                        nodes.last().unwrap().parameter <= range[1] + 1e-7
+                    } else {
+                        (nodes.last().unwrap().parameter - range[1]).abs() <= 1e-7
+                    },
+                    "Hermite node range does not match end parameters"
+                );
+                Ok(Self::HermiteSpline {
+                    nodes,
+                    range,
+                    periodic,
+                })
+            }
             name => bail!("unsupported parametric profile curve {name}"),
         }
     }
@@ -176,6 +273,28 @@ impl Curve {
                 *center,
                 mul(add(mul(*x, t.cos()), mul(*y, t.sin())), *radius),
             ),
+            Self::Ellipse {
+                center,
+                x,
+                y,
+                x_len,
+                y_len,
+                ..
+            } => add(
+                *center,
+                add(mul(*x, *x_len * t.cos()), mul(*y, *y_len * t.sin())),
+            ),
+            Self::HermiteSpline {
+                nodes,
+                range,
+                periodic,
+            } => {
+                if *periodic {
+                    periodic_hermite_value(nodes, *range, t, false)
+                } else {
+                    hermite_value(nodes, t, false)
+                }
+            }
         }
     }
     fn derivative(&self, t: f64) -> Point {
@@ -184,8 +303,282 @@ impl Curve {
             Self::Arc { x, y, radius, .. } => {
                 mul(add(mul(*x, -t.sin()), mul(*y, t.cos())), *radius)
             }
+            Self::Ellipse {
+                x, y, x_len, y_len, ..
+            } => add(mul(*x, -*x_len * t.sin()), mul(*y, *y_len * t.cos())),
+            Self::HermiteSpline {
+                nodes,
+                range,
+                periodic,
+            } => {
+                if *periodic {
+                    periodic_hermite_value(nodes, *range, t, true)
+                } else {
+                    hermite_value(nodes, t, true)
+                }
+            }
         }
     }
+
+    pub(crate) fn tessellation_budget(&self, chord: f64) -> f64 {
+        match self {
+            Self::Line {
+                direction, range, ..
+            } => {
+                let displacement = std::array::from_fn(|k| direction[k] * (range[1] - range[0]));
+                len(displacement).ceil().max(1.)
+            }
+            Self::Arc { radius, range, .. } => {
+                let span = (range[1] - range[0]).abs();
+                let step = (4. * (chord / (2. * radius.max(chord))).min(1.).sqrt().asin())
+                    .min(std::f64::consts::FRAC_PI_2);
+                (span / step).ceil().max(1.)
+            }
+            Self::Ellipse {
+                x_len,
+                y_len,
+                range,
+                ..
+            } => {
+                let radius = x_len.max(*y_len);
+                let span = (range[1] - range[0]).abs();
+                let step = (4. * (chord / (2. * radius.max(chord))).min(1.).sqrt().asin())
+                    .min(std::f64::consts::FRAC_PI_2);
+                (span / step).ceil().max(1.)
+            }
+            Self::HermiteSpline {
+                nodes,
+                range,
+                periodic,
+            } => {
+                let mut n: f64 = 0.;
+                let mut pairs = nodes
+                    .windows(2)
+                    .map(|pair| (pair[0].clone(), pair[1].clone()))
+                    .collect::<Vec<_>>();
+                if *periodic {
+                    let mut first = nodes[0].clone();
+                    first.parameter += range[1] - range[0];
+                    if first.parameter - nodes.last().unwrap().parameter > 1e-12 {
+                        pairs.push((nodes.last().unwrap().clone(), first));
+                    }
+                }
+                for (a, b) in pairs {
+                    let delta = b.parameter - a.parameter;
+                    let second = |s: f64| {
+                        std::array::from_fn(|k| {
+                            ((12. * s - 6.) * a.point[k]
+                                + (6. * s - 4.) * delta * a.tangent[k]
+                                + (-12. * s + 6.) * b.point[k]
+                                + (6. * s - 2.) * delta * b.tangent[k])
+                                / (delta * delta)
+                        })
+                    };
+                    let acceleration = len(second(0.)).max(len(second(1.)));
+                    let step = if acceleration > 1e-15 {
+                        (8. * chord / acceleration).sqrt().min(delta)
+                    } else {
+                        delta
+                    };
+                    n += delta / step;
+                }
+                n.ceil().max(1.)
+            }
+        }
+    }
+
+    pub(crate) fn max_revolution_radius(&self) -> f64 {
+        let radius = |p: Point| p[0].hypot(p[1]);
+        match self {
+            Self::Line {
+                origin,
+                direction,
+                range,
+            } => [range[0], range[1]]
+                .into_iter()
+                .map(|t| radius(add(*origin, mul(*direction, t))))
+                .fold(0., f64::max),
+            Self::Arc {
+                center, radius: r, ..
+            } => radius(*center) + r,
+            Self::Ellipse {
+                center,
+                x_len,
+                y_len,
+                ..
+            } => radius(*center) + x_len.max(*y_len),
+            Self::HermiteSpline {
+                nodes,
+                range,
+                periodic,
+            } => {
+                let mut points = nodes
+                    .windows(2)
+                    .flat_map(|pair| {
+                        let a = &pair[0];
+                        let b = &pair[1];
+                        let delta = b.parameter - a.parameter;
+                        [
+                            a.point,
+                            add(a.point, mul(a.tangent, delta / 3.)),
+                            sub(b.point, mul(b.tangent, delta / 3.)),
+                            b.point,
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                if *periodic {
+                    let a = nodes.last().unwrap();
+                    let b = &nodes[0];
+                    let delta = range[1] - range[0] - a.parameter + b.parameter;
+                    if delta > 1e-12 {
+                        points.extend([
+                            a.point,
+                            add(a.point, mul(a.tangent, delta / 3.)),
+                            sub(b.point, mul(b.tangent, delta / 3.)),
+                            b.point,
+                        ]);
+                    }
+                }
+                points.into_iter().map(radius).fold(0., f64::max)
+            }
+        }
+    }
+}
+
+fn hermite_segment(nodes: &[HermiteNode], t: f64) -> (&HermiteNode, &HermiteNode, f64) {
+    let mut index = nodes.len() - 2;
+    for (i, pair) in nodes.windows(2).enumerate() {
+        if t <= pair[1].parameter {
+            index = i;
+            break;
+        }
+    }
+    let a = &nodes[index];
+    let b = &nodes[index + 1];
+    let s = ((t - a.parameter) / (b.parameter - a.parameter)).clamp(0., 1.);
+    (a, b, s)
+}
+
+fn hermite_value(nodes: &[HermiteNode], t: f64, derivative: bool) -> Point {
+    let (a, b, s) = hermite_segment(nodes, t);
+    hermite_value_with_fraction(a, b, s, derivative)
+}
+
+fn hermite_value_with_fraction(
+    a: &HermiteNode,
+    b: &HermiteNode,
+    s: f64,
+    derivative: bool,
+) -> Point {
+    let delta = b.parameter - a.parameter;
+    let (h00, h10, h01, h11) = if derivative {
+        (
+            (6. * s * s - 6. * s) / delta,
+            3. * s * s - 4. * s + 1.,
+            (-6. * s * s + 6. * s) / delta,
+            3. * s * s - 2. * s,
+        )
+    } else {
+        (
+            2. * s * s * s - 3. * s * s + 1.,
+            s * s * s - 2. * s * s + s,
+            -2. * s * s * s + 3. * s * s,
+            s * s * s - s * s,
+        )
+    };
+    let tangent_scale = if derivative { 1. } else { delta };
+    add(
+        add(mul(a.point, h00), mul(a.tangent, tangent_scale * h10)),
+        add(mul(b.point, h01), mul(b.tangent, tangent_scale * h11)),
+    )
+}
+
+fn periodic_hermite_value(
+    nodes: &[HermiteNode],
+    range: [f64; 2],
+    t: f64,
+    derivative: bool,
+) -> Point {
+    let period = range[1] - range[0];
+    let local = range[0] + (t - range[0]).rem_euclid(period);
+    if local <= nodes.last().unwrap().parameter {
+        return hermite_value(nodes, local, derivative);
+    }
+    let a = nodes.last().unwrap();
+    let mut b = nodes[0].clone();
+    b.parameter += period;
+    let s = ((local - a.parameter) / (b.parameter - a.parameter)).clamp(0., 1.);
+    hermite_value_with_fraction(a, &b, s, derivative)
+}
+
+fn hermite_surface_coefficients(s: f64, span: f64, derivative: bool) -> [f64; 4] {
+    if derivative {
+        [
+            (6. * s * s - 6. * s) / span,
+            3. * s * s - 4. * s + 1.,
+            (-6. * s * s + 6. * s) / span,
+            3. * s * s - 2. * s,
+        ]
+    } else {
+        [
+            2. * s * s * s - 3. * s * s + 1.,
+            span * (s * s * s - 2. * s * s + s),
+            -2. * s * s * s + 3. * s * s,
+            span * (s * s * s - s * s),
+        ]
+    }
+}
+
+fn hermite_surface_point(
+    nodes: &[HermiteSurfaceNode],
+    u_params: &[f64],
+    v_params: &[f64],
+    u: f64,
+    v: f64,
+    derivative_u: bool,
+    derivative_v: bool,
+) -> Result<Point> {
+    let ui = u_params
+        .windows(2)
+        .position(|pair| u <= pair[1])
+        .unwrap_or(u_params.len() - 2);
+    let vi = v_params
+        .windows(2)
+        .position(|pair| v <= pair[1])
+        .unwrap_or(v_params.len() - 2);
+    let us = u_params[ui + 1] - u_params[ui];
+    let vs = v_params[vi + 1] - v_params[vi];
+    ensure!(
+        us > 0. && vs > 0.,
+        "Hermite surface parameter span is invalid"
+    );
+    let su = ((u - u_params[ui]) / us).clamp(0., 1.);
+    let sv = ((v - v_params[vi]) / vs).clamp(0., 1.);
+    let cu = hermite_surface_coefficients(su, us, derivative_u);
+    let cv = hermite_surface_coefficients(sv, vs, derivative_v);
+    let at = |j: usize, i: usize| &nodes[j * u_params.len() + i];
+    let p00 = at(vi, ui);
+    let p10 = at(vi, ui + 1);
+    let p01 = at(vi + 1, ui);
+    let p11 = at(vi + 1, ui + 1);
+    Ok(std::array::from_fn(|k| {
+        p00.point[k] * cu[0] * cv[0]
+            + p00.u_tangent[k] * cu[1] * cv[0]
+            + p10.point[k] * cu[2] * cv[0]
+            + p10.u_tangent[k] * cu[3] * cv[0]
+            + p01.point[k] * cu[0] * cv[2]
+            + p01.u_tangent[k] * cu[1] * cv[2]
+            + p11.point[k] * cu[2] * cv[2]
+            + p11.u_tangent[k] * cu[3] * cv[2]
+            + p00.v_tangent[k] * cu[0] * cv[1]
+            + p00.mixed_derivative[k] * cu[1] * cv[1]
+            + p10.v_tangent[k] * cu[2] * cv[1]
+            + p10.mixed_derivative[k] * cu[3] * cv[1]
+            + p01.v_tangent[k] * cu[0] * cv[3]
+            + p01.mixed_derivative[k] * cu[1] * cv[3]
+            + p11.v_tangent[k] * cu[2] * cv[3]
+            + p11.mixed_derivative[k] * cu[3] * cv[3]
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -199,11 +592,28 @@ pub enum ParametricSurface {
         orient: bool,
         profile: Curve,
     },
+    ConeSurf {
+        center: Point,
+        x: Point,
+        y: Point,
+        z: Point,
+        envelope: [[f64; 2]; 2],
+        orient: bool,
+        half_angle: f64,
+    },
     RuledSurf {
         envelope: [[f64; 2]; 2],
         orient: bool,
         profile1: Curve,
         profile2: Curve,
+    },
+    HermiteSurf {
+        envelope: [[f64; 2]; 2],
+        orient: bool,
+        u_params: Vec<f64>,
+        v_params: Vec<f64>,
+        periodic: [bool; 2],
+        nodes: Vec<HermiteSurfaceNode>,
     },
 }
 
@@ -237,25 +647,143 @@ impl ParametricSurface {
                     profile,
                 })
             }
-            "RuledSurf" => Ok(Self::RuledSurf {
-                envelope,
-                orient: s.fields["m_orientFlag"]
-                    .as_bool()
-                    .context("surface orientation")?,
-                profile1: Curve::read(g, target(g, si, &s.fields["m_pProfileCurve1"])?)?,
-                profile2: Curve::read(g, target(g, si, &s.fields["m_pProfileCurve2"])?)?,
-            }),
+            "ConeSurf" => {
+                let (x, y, z) = basis(&s.fields)?;
+                let half_angle = s.fields["m_halfAngle"]
+                    .as_f64()
+                    .context("cone half angle")?;
+                ensure!(
+                    half_angle.is_finite()
+                        && half_angle > 1e-9
+                        && half_angle < std::f64::consts::PI - 1e-9
+                        && half_angle.sin().abs() > 1e-9,
+                    "invalid cone half angle"
+                );
+                Ok(Self::ConeSurf {
+                    center: p(&s.fields["m_center"], "cone center")?,
+                    x,
+                    y,
+                    z,
+                    envelope,
+                    orient: s.fields["m_orientFlag"]
+                        .as_bool()
+                        .context("cone orientation")?,
+                    half_angle,
+                })
+            }
+            "RuledSurf" => {
+                let profile1 = Curve::read(g, target(g, si, &s.fields["m_pProfileCurve1"])?)?;
+                let profile2 = if s.fields["m_pProfileCurve2"]["pointer_token"].as_u64() == Some(0)
+                {
+                    let point1 = p(&s.fields["m_Point1"], "ruled surface point 1")?;
+                    let point2 = p(&s.fields["m_Point2"], "ruled surface point 2")?;
+                    Curve::line(
+                        point1,
+                        sub(point2, point1),
+                        [envelope[0][0], envelope[1][0]],
+                    )
+                } else {
+                    Curve::read(g, target(g, si, &s.fields["m_pProfileCurve2"])?)?
+                };
+                Ok(Self::RuledSurf {
+                    envelope,
+                    orient: s.fields["m_orientFlag"]
+                        .as_bool()
+                        .context("surface orientation")?,
+                    profile1,
+                    profile2,
+                })
+            }
+            "HermiteSurf" => {
+                let u_params = s.fields["m_uParams"]
+                    .as_array()
+                    .context("Hermite surface u parameters")?
+                    .iter()
+                    .map(|value| value.as_f64().context("Hermite surface u parameter"))
+                    .collect::<Result<Vec<_>>>()?;
+                let v_params = s.fields["m_vParams"]
+                    .as_array()
+                    .context("Hermite surface v parameters")?
+                    .iter()
+                    .map(|value| value.as_f64().context("Hermite surface v parameter"))
+                    .collect::<Result<Vec<_>>>()?;
+                let periodic: [bool; 2] = s.fields["m_periodic"]
+                    .as_array()
+                    .context("Hermite surface periodic flags")?
+                    .iter()
+                    .map(|value| value.as_bool().context("Hermite surface periodic flag"))
+                    .collect::<Result<Vec<_>>>()?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Hermite surface periodic flag count"))?;
+                ensure!(
+                    !periodic[0] && !periodic[1],
+                    "periodic Hermite surface unsupported"
+                );
+                ensure!(
+                    u_params.len() >= 2
+                        && v_params.len() >= 2
+                        && u_params.windows(2).all(|pair| pair[1] > pair[0])
+                        && v_params.windows(2).all(|pair| pair[1] > pair[0]),
+                    "Hermite surface parameter grid is invalid"
+                );
+                let values = s.fields["m_NodeArray"]
+                    .as_array()
+                    .context("Hermite surface nodes")?;
+                ensure!(
+                    values.len() == u_params.len() * v_params.len(),
+                    "Hermite surface node grid is invalid"
+                );
+                let mut nodes = Vec::with_capacity(values.len());
+                for value in values {
+                    let tangent = value["m_iTangent"]
+                        .as_array()
+                        .context("Hermite surface tangents")?;
+                    ensure!(tangent.len() == 2, "Hermite surface tangent count");
+                    nodes.push(HermiteSurfaceNode {
+                        point: p(&value["m_iPoint"], "Hermite surface point")?,
+                        u_tangent: p(&tangent[0], "Hermite surface u tangent")?,
+                        v_tangent: p(&tangent[1], "Hermite surface v tangent")?,
+                        mixed_derivative: p(
+                            &value["m_iMixedDer"],
+                            "Hermite surface mixed derivative",
+                        )?,
+                    });
+                }
+                ensure!(
+                    (u_params[0] - envelope[0][0]).abs() <= 1e-7
+                        && (u_params.last().unwrap() - envelope[1][0]).abs() <= 1e-7
+                        && (v_params[0] - envelope[0][1]).abs() <= 1e-7
+                        && (v_params.last().unwrap() - envelope[1][1]).abs() <= 1e-7,
+                    "Hermite surface grid/envelope mismatch"
+                );
+                Ok(Self::HermiteSurf {
+                    envelope,
+                    orient: s.fields["m_orientFlag"]
+                        .as_bool()
+                        .context("surface orientation")?,
+                    u_params,
+                    v_params,
+                    periodic,
+                    nodes,
+                })
+            }
             name => bail!("unsupported parametric surface {name}"),
         }
     }
     pub fn bounds(&self) -> [[f64; 2]; 2] {
         match self {
-            Self::SurfRev { envelope, .. } | Self::RuledSurf { envelope, .. } => *envelope,
+            Self::SurfRev { envelope, .. }
+            | Self::ConeSurf { envelope, .. }
+            | Self::RuledSurf { envelope, .. }
+            | Self::HermiteSurf { envelope, .. } => *envelope,
         }
     }
     pub fn orientation(&self) -> bool {
         match self {
-            Self::SurfRev { orient, .. } | Self::RuledSurf { orient, .. } => *orient,
+            Self::SurfRev { orient, .. }
+            | Self::ConeSurf { orient, .. }
+            | Self::RuledSurf { orient, .. }
+            | Self::HermiteSurf { orient, .. } => *orient,
         }
     }
     pub fn evaluate(&self, u: f64, v: f64) -> Result<Point> {
@@ -287,6 +815,27 @@ impl ParametricSurface {
                     add(add(mul(*x, local[0]), mul(*y, local[1])), mul(*z, local[2])),
                 )
             }
+            Self::ConeSurf {
+                center,
+                x,
+                y,
+                z,
+                half_angle,
+                ..
+            } => {
+                let (sin, cos) = half_angle.sin_cos();
+                let radial = [u.cos(), u.sin(), 0.];
+                add(
+                    *center,
+                    mul(
+                        add(
+                            add(mul(*x, sin * radial[0]), mul(*y, sin * radial[1])),
+                            mul(*z, cos),
+                        ),
+                        v,
+                    ),
+                )
+            }
             Self::RuledSurf {
                 envelope: _,
                 profile1,
@@ -299,6 +848,12 @@ impl ParametricSurface {
                     mul(profile2.eval(t(profile2)), v),
                 )
             }
+            Self::HermiteSurf {
+                u_params,
+                v_params,
+                nodes,
+                ..
+            } => hermite_surface_point(nodes, u_params, v_params, u, v, false, false)?,
         })
     }
     pub fn normal(&self, u: f64, v: f64) -> Result<Point> {
@@ -353,6 +908,46 @@ impl ParametricSurface {
             }
             return Ok(mul(n, if *orient { 1. / len(n) } else { -1. / len(n) }));
         }
+        if let Self::HermiteSurf {
+            u_params,
+            v_params,
+            nodes,
+            orient,
+            ..
+        } = self
+        {
+            let du = hermite_surface_point(nodes, u_params, v_params, u, v, true, false)?;
+            let dv = hermite_surface_point(nodes, u_params, v_params, u, v, false, true)?;
+            let n = cross(du, dv);
+            let l = len(n);
+            ensure!(
+                n.iter().all(|value| value.is_finite()) && l > 1e-12,
+                "Hermite surface normal is singular"
+            );
+            return Ok(mul(n, if *orient { 1. / l } else { -1. / l }));
+        }
+        if let Self::ConeSurf {
+            x,
+            y,
+            z,
+            orient,
+            half_angle,
+            ..
+        } = self
+        {
+            let (sin, cos) = half_angle.sin_cos();
+            let (su, cu) = u.sin_cos();
+            let transform = |q: Point| add(add(mul(*x, q[0]), mul(*y, q[1])), mul(*z, q[2]));
+            let du = transform([-v * sin * su, v * sin * cu, 0.]);
+            let dv = transform([sin * cu, sin * su, cos]);
+            let n = cross(du, dv);
+            let l = len(n);
+            ensure!(
+                l.is_finite() && l > 1e-12,
+                "cone surface normal is singular"
+            );
+            return Ok(mul(n, if *orient { 1. / l } else { -1. / l }));
+        }
         let Self::RuledSurf {
             profile1,
             profile2,
@@ -394,7 +989,10 @@ fn cross(a: Point, b: Point) -> Point {
 
 fn c_range(c: &Curve) -> [f64; 2] {
     match c {
-        Curve::Line { range, .. } | Curve::Arc { range, .. } => *range,
+        Curve::Line { range, .. }
+        | Curve::Arc { range, .. }
+        | Curve::Ellipse { range, .. }
+        | Curve::HermiteSpline { range, .. } => *range,
     }
 }
 
@@ -453,6 +1051,73 @@ mod tests {
         graph.objects[0].fields["m_orientFlag"] = Value::Bool(false);
         let reversed = ParametricSurface::read(&graph, 0).unwrap();
         assert_eq!(reversed.normal(0.0, 0.5).unwrap(), [-1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn hermite_spline_reads_nodes_and_evaluates_cubic_segment() {
+        let graph = g(
+            vec![o(
+                "GHermiteSpline",
+                1,
+                2,
+                serde_json::json!({
+                    "m_NodeArray": [
+                        {"m_iParametr": 0., "m_iPoint": [0., 0., 0.], "m_iTangent": [1., 0., 0.]},
+                        {"m_iParametr": 1., "m_iPoint": [1., 1., 0.], "m_iTangent": [0., 1., 0.]}
+                    ],
+                    "m_Periodic": false,
+                    "m_endParams": [0., 1.]
+                }),
+            )],
+            vec![],
+        );
+        let curve = Curve::read(&graph, 0).unwrap();
+        assert_eq!(curve.eval(0.), [0., 0., 0.]);
+        assert_eq!(curve.eval(1.), [1., 1., 0.]);
+        let midpoint = curve.eval(0.5);
+        assert!((midpoint[0] - 0.625).abs() < 1e-12);
+        assert!((midpoint[1] - 0.375).abs() < 1e-12);
+        assert_eq!(curve.derivative(0.), [1., 0., 0.]);
+        assert_eq!(curve.derivative(1.), [0., 1., 0.]);
+        assert!(curve.tessellation_budget(0.0001) > 1.);
+    }
+
+    #[test]
+    fn periodic_hermite_spline_evaluates_closing_segment_and_wraps() {
+        let period = std::f64::consts::TAU;
+        let graph = g(
+            vec![o(
+                "GHermiteSpline",
+                1,
+                2,
+                serde_json::json!({
+                    "m_NodeArray": [
+                        {"m_iParametr": 0., "m_iPoint": [2., 0., 0.], "m_iTangent": [0., 1., 0.]},
+                        {"m_iParametr": 1.5707963267948966, "m_iPoint": [0., 2., 0.], "m_iTangent": [-1., 0., 0.]},
+                        {"m_iParametr": 3.141592653589793, "m_iPoint": [-2., 0., 0.], "m_iTangent": [0., -1., 0.]},
+                        {"m_iParametr": 4.71238898038469, "m_iPoint": [0., -2., 0.], "m_iTangent": [1., 0., 0.]}
+                    ],
+                    "m_Periodic": true,
+                    "m_endParams": [0., 6.283185307179586]
+                }),
+            )],
+            vec![],
+        );
+        let curve = Curve::read(&graph, 0).unwrap();
+        let start = curve.eval(0.);
+        let end = curve.eval(period);
+        assert!(start.iter().zip(end).all(|(a, b)| (a - b).abs() < 1e-12));
+        let closing = curve.eval(5.497787143782138);
+        assert!(closing[0] > 0. && closing[1] < 0., "{closing:?}");
+        let wrapped = curve.eval(-0.7853981633974483);
+        assert!(
+            wrapped
+                .iter()
+                .zip(closing)
+                .all(|(a, b)| (a - b).abs() < 1e-12)
+        );
+        assert!(curve.max_revolution_radius() >= 2.);
+        assert!(curve.tessellation_budget(0.01) > 4.);
     }
     #[test]
     fn ruled_surface_blends_profiles() {
@@ -518,6 +1183,27 @@ mod tests {
             .normal(0.5, 0.5)
             .unwrap();
         assert_eq!(negative, [-positive[0], -positive[1], -positive[2]]);
+    }
+
+    #[test]
+    fn cone_surface_uses_slant_distance_and_half_angle() {
+        let surface = ParametricSurface::ConeSurf {
+            center: [1., 2., 3.],
+            x: [1., 0., 0.],
+            y: [0., 1., 0.],
+            z: [0., 0., 1.],
+            envelope: [[0., 1.], [std::f64::consts::FRAC_PI_2, 2.]],
+            orient: true,
+            half_angle: std::f64::consts::FRAC_PI_4,
+        };
+        let p = surface.evaluate(0., 2.).unwrap();
+        let diagonal = 2_f64.sqrt();
+        assert!((p[0] - (1. + diagonal)).abs() < 1e-12);
+        assert_eq!(p[1], 2.);
+        assert!((p[2] - (3. + diagonal)).abs() < 1e-12);
+        let n = surface.normal(0., 2.).unwrap();
+        assert!((n[0] - 2_f64.sqrt() / 2.).abs() < 1e-12);
+        assert!((n[2] + 2_f64.sqrt() / 2.).abs() < 1e-12);
     }
 
     #[test]

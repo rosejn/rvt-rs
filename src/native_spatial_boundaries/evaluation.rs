@@ -85,6 +85,10 @@ fn target<'a>(
     Ok((i, &o.fields))
 }
 impl Builder {
+    pub(super) fn level_elevations(&self) -> BTreeMap<i64, f64> {
+        self.elevations.clone()
+    }
+
     pub(super) fn ingest(&mut self, r: &Record) -> Result<()> {
         if !matches!(
             r.class_name.as_deref(),

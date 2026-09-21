@@ -271,7 +271,10 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
         }
         ensure!((end - max[axis]).abs() < 1e-7, "incomplete trim perimeter");
     }
-    const CHORD: f64 = 0.001;
+    // Match the saved-cylinder tessellation accuracy. The Revit-authored lab
+    // includes small spheres and toruses whose volume residual is dominated by
+    // this surface chord error rather than by graph decoding.
+    const CHORD: f64 = 0.0001;
     let length = |p: [f64; 3]| p.iter().map(|x| x * x).sum::<f64>().sqrt();
     let angular = |r: f64| {
         (4. * (CHORD / (2. * r.max(CHORD))).min(1.).sqrt().asin()).min(std::f64::consts::FRAC_PI_2)
@@ -291,7 +294,29 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
                 angular(center[0].hypot(center[1]) + 2. * radius),
                 angular(*radius),
             ),
+            Curve::Ellipse {
+                center,
+                x_len,
+                y_len,
+                ..
+            } => (
+                angular(center[0].hypot(center[1]) + x_len.max(*y_len)),
+                angular(x_len.min(*y_len)),
+            ),
+            Curve::HermiteSpline { range, .. } => (
+                angular(profile.max_revolution_radius()),
+                (range[1] - range[0]) / profile.tessellation_budget(CHORD),
+            ),
         },
+        ParametricSurface::ConeSurf { half_angle, .. } => {
+            let radius = [min[1], max[1]]
+                .into_iter()
+                .map(|v| v.abs() * half_angle.sin().abs())
+                .fold(0., f64::max);
+            // Cone generators are straight in saved slant-distance space, so
+            // the curvature budget applies to U. Trim knots still split V.
+            (angular(radius), 1.)
+        }
         ParametricSurface::RuledSurf { .. } => {
             // A shared normalized grid across ruled patches preserves their
             // common straight generator edges even when profile lengths differ.
@@ -313,33 +338,39 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
                 }
                 let s = ParametricSurface::read(g, surface_index)?;
                 let ParametricSurface::RuledSurf {
-                    profile1:
-                        Curve::Line {
-                            direction: a,
-                            range: ra,
-                            ..
-                        },
-                    profile2:
-                        Curve::Line {
-                            direction: b,
-                            range: rb,
-                            ..
-                        },
-                    ..
+                    profile1, profile2, ..
                 } = s
                 else {
-                    anyhow::bail!("nonlinear ruled profiles need a curvature policy")
+                    unreachable!()
                 };
-                let da = std::array::from_fn(|k| a[k] * (ra[1] - ra[0]));
-                let db = std::array::from_fn(|k| b[k] * (rb[1] - rb[0]));
-                let mixed = length(std::array::from_fn(|k| da[k] - db[k]));
                 n = n
-                    .max((mixed / CHORD).sqrt().ceil())
-                    .max(length(da).ceil())
-                    .max(length(db).ceil());
+                    .max(profile1.tessellation_budget(CHORD))
+                    .max(profile2.tessellation_budget(CHORD));
+                if let (
+                    Curve::Line {
+                        direction: a,
+                        range: ra,
+                        ..
+                    },
+                    Curve::Line {
+                        direction: b,
+                        range: rb,
+                        ..
+                    },
+                ) = (&profile1, &profile2)
+                {
+                    let da: [f64; 3] = std::array::from_fn(|k| a[k] * (ra[1] - ra[0]));
+                    let db: [f64; 3] = std::array::from_fn(|k| b[k] * (rb[1] - rb[0]));
+                    let mixed = length(std::array::from_fn(|k| da[k] - db[k]));
+                    n = n.max((mixed / CHORD).sqrt().ceil());
+                }
             }
             (1. / n, 1. / n)
         }
+        ParametricSurface::HermiteSurf { .. } => (
+            ((max[0] - min[0]) / 64.).max(1e-6),
+            ((max[1] - min[1]) / 64.).max(1e-6),
+        ),
     };
     let axis = |k: usize, step: f64| -> Result<Vec<f64>> {
         let count = ((max[k] - min[k]) / step).ceil().max(1.);
@@ -506,9 +537,10 @@ pub fn tessellate_uv(
             .ok_or_else(|| anyhow::anyhow!("parametric triangle count overflow"))?,
     );
     let surface_orient = match surface {
-        ParametricSurface::SurfRev { orient, .. } | ParametricSurface::RuledSurf { orient, .. } => {
-            *orient
-        }
+        ParametricSurface::SurfRev { orient, .. }
+        | ParametricSurface::ConeSurf { orient, .. }
+        | ParametricSurface::RuledSurf { orient, .. }
+        | ParametricSurface::HermiteSurf { orient, .. } => *orient,
     };
     let winding = surface_orient == orient;
     let stride = u_knots.len();
@@ -626,6 +658,23 @@ mod tests {
         let mesh = tessellate(&pole_surface(), 8, 2, 100).unwrap();
         assert!(!mesh.triangles.is_empty());
         assert!(mesh.triangles.len() < 8 * 2 * 2);
+    }
+
+    #[test]
+    fn cone_surface_tessellates_with_angular_error_budget() {
+        let surface = ParametricSurface::ConeSurf {
+            center: [0., 0., 0.],
+            x: [1., 0., 0.],
+            y: [0., 1., 0.],
+            z: [0., 0., 1.],
+            envelope: [[0., 0.5], [std::f64::consts::TAU, 2.]],
+            orient: true,
+            half_angle: std::f64::consts::FRAC_PI_4,
+        };
+        let mesh = tessellate(&surface, 16, 2, 1000).unwrap();
+        assert_eq!(mesh.vertices.len(), 17 * 3);
+        assert!(!mesh.triangles.is_empty());
+        assert!(mesh.normals.iter().all(|n| n.iter().all(|v| v.is_finite())));
     }
 
     fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {

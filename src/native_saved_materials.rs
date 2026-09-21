@@ -6,6 +6,13 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SavedTextureReference {
+    pub slot: String,
+    pub paths: Vec<String>,
+    pub raw_value: String,
+    pub source: Value,
+}
+#[derive(Debug, Clone, Serialize)]
 pub struct RenderMaterial {
     pub material_id: Option<i64>,
     pub name: String,
@@ -13,6 +20,7 @@ pub struct RenderMaterial {
     pub saved_opacity: Option<f64>,
     pub metallic_factor: f64,
     pub roughness_factor: f64,
+    pub saved_texture_references: Vec<SavedTextureReference>,
     pub diagnostics: Vec<String>,
     pub provenance: Vec<Value>,
 }
@@ -54,6 +62,28 @@ impl Resolver {
         }
         Ok(())
     }
+
+    /// IDs discovered while projecting already-selected material/style/owner
+    /// records. Callers can fetch only the next dependency layer instead of
+    /// rescanning every channel-102 record in the document.
+    pub fn dependency_ids(&self) -> std::collections::BTreeSet<u64> {
+        let mut ids = std::collections::BTreeSet::new();
+        for id in self
+            .appearance_refs
+            .values()
+            .chain(self.owner_types.values().map(|(id, _)| id))
+            .chain(self.type_materials.values().map(|(id, _)| id))
+            .chain(self.styles.values().map(|(id, _)| id))
+            .chain(self.paint.values().map(|(id, _)| id))
+            .chain(self.category_styles.values().flatten().map(|(id, _)| id))
+        {
+            if *id > 0 {
+                ids.insert(*id as u64);
+            }
+        }
+        ids
+    }
+
     fn project(&mut self, r: &Record) -> Result<()> {
         let Some(g) = &r.graph else {
             return Ok(());
@@ -262,19 +292,30 @@ impl Resolver {
             render_style_id,
             explicit_material_id,
         );
-        let mut m = if selected == -1 && self.initialized_generic_traits {
-            RenderMaterial {
+        let mut m = if selected < 0 && self.initialized_generic_traits {
+            let mut material = RenderMaterial {
                 material_id: None,
                 name: "default viewport material".to_string(),
                 saved_opacity: None,
                 base_color: [127.0 / 255.0, 127.0 / 255.0, 127.0 / 255.0, 1.0],
                 metallic_factor: 0.0,
                 roughness_factor: generic_roughness(0.5, 0.1).ok()?,
+                saved_texture_references: vec![],
                 diagnostics: vec![],
                 provenance: vec![
                     json!({"source":"initialized_viewport_traits","not_serialized_material_property":true,"diffuse_packed_rgb":8355711,"direct_reflectivity":0.5,"glossiness":0.1}),
                 ],
-            }
+            };
+            material.diagnostics.push(format!(
+                "negative saved render style {selected} resolved through the default viewport material"
+            ));
+            material.provenance.push(json!({
+                "source": "saved_negative_render_style_sentinel",
+                "render_style_id": selected,
+                "material_identity": "none",
+                "semantics": "no positive MaterialElem binding was serialized"
+            }));
+            material
         } else {
             self.materials.get(&selected)?.clone()
         };
@@ -327,18 +368,44 @@ fn project_material(
     m: &Value,
     initialized_context: bool,
 ) -> Result<RenderMaterial> {
-    ensure!(
-        m["m_bUseRenderAppearance"].as_bool().is_some(),
-        "missing diffuse source flag"
-    );
+    let use_render_appearance = m["m_bUseRenderAppearance"]
+        .as_bool()
+        .ok_or_else(|| anyhow::anyhow!("missing diffuse source flag"))?;
     let base_color = packed_color(m)?;
     let asset = &m["m_asset"];
     let schema = asset["m_sName"].as_str().unwrap_or("");
+    if !use_render_appearance {
+        return Ok(RenderMaterial {
+            material_id: Some(r.identity.element_id as i64),
+            name: m["m_name"].as_str().unwrap_or("").to_string(),
+            base_color,
+            saved_opacity: Some(base_color[3]),
+            metallic_factor: 0.0,
+            roughness_factor: 1.0,
+            saved_texture_references: saved_texture_references(r, g),
+            diagnostics: vec![
+                "Material uses saved graphics color without a render appearance; roughness is uncalibrated"
+                    .into(),
+            ],
+            provenance: vec![
+                source(r, i, "m_color/m_transparency/m_bUseRenderAppearance"),
+                json!({
+                    "source": "saved_material_graphics_color",
+                    "saved_render_appearance": false,
+                    "saved_color_retained": true,
+                    "roughness": 1.0,
+                    "roughness_calibrated": false,
+                }),
+            ],
+        });
+    }
+    let mut diagnostics = Vec::new();
     let mut provenance = vec![source(
         r,
         i,
         "m_color/m_transparency/m_bUseRenderAppearance/m_asset",
     )];
+    let saved_texture_references = saved_texture_references(r, g);
     let roughness = if schema == "Generic"
         && identifier(&m["m_appearanceAssetId"])? == -1
         && asset["m_aAProperties"]
@@ -346,12 +413,60 @@ fn project_material(
             .is_some_and(Vec::is_empty)
     {
         1.0
+    } else if schema == "Generic" {
+        diagnostics.push(
+            "Generic appearance asset variant retained with saved color; roughness is uncalibrated"
+                .into(),
+        );
+        1.0
     } else if schema == "HardwoodSchema" && initialized_context {
         provenance.push(json!({"source":"initialized_viewport_traits","not_serialized_material_property":true,"direct_reflectivity":0.5,"glossiness":0.1,"reason":"Hardwood structural handler preserves initialized specular gloss"}));
         generic_roughness(0.5, 0.1)?
+    } else if schema == "Plastic-001" || schema.starts_with("Plastic-") {
+        // This preset carries the saved graphics color and asset identity but
+        // does not serialize the calibrated reflectivity/glossiness pair used
+        // by the GenericSchema conversion. Keep it renderable with an
+        // explicit, auditable uncalibrated roughness instead of pretending a
+        // generic conversion is supported.
+        diagnostics.push(format!(
+            "{schema} retained with saved color; roughness is uncalibrated"
+        ));
+        provenance.push(json!({
+            "source": "saved_appearance_asset_preset",
+            "asset_schema": schema,
+            "saved_color_retained": true,
+            "roughness": 1.0,
+            "roughness_calibrated": false,
+        }));
+        1.0
+    } else if schema.starts_with("Paint-") {
+        // Paint presets serialize their graphics color and finish/application
+        // selectors, but the calibrated viewport roughness is not represented
+        // by the qualified generic asset-property contract. Keep the exact
+        // saved color and surface as renderable, with the approximation made
+        // explicit instead of rejecting otherwise usable geometry.
+        diagnostics.push(format!(
+            "{schema} retained with saved color; roughness is uncalibrated"
+        ));
+        provenance.push(json!({
+            "source": "saved_appearance_asset_preset",
+            "asset_schema": schema,
+            "saved_color_retained": true,
+            "roughness": 1.0,
+            "roughness_calibrated": false,
+        }));
+        1.0
     } else {
         ensure!(
-            ["GenericSchema", "MetalSchema", "WallPaintSchema"].contains(&schema),
+            [
+                "GenericSchema",
+                "MetalSchema",
+                "MetallicPaint",
+                "WallPaintSchema",
+                "GlazingSchema",
+                "Glazing-012"
+            ]
+            .contains(&schema),
             "appearance schema {schema} not qualified for viewport roughness"
         );
         let mut props = BTreeMap::new();
@@ -377,21 +492,34 @@ fn project_material(
                 );
             }
         }
-        if schema == "MetalSchema" || schema == "WallPaintSchema" {
-            let key = if schema == "MetalSchema" {
-                "metal_finish"
-            } else {
-                "wallpaint_finish"
+        if matches!(schema, "MetalSchema" | "MetallicPaint" | "WallPaintSchema") {
+            let key = match schema {
+                "MetallicPaint" => "metallicpaint_finish",
+                "MetalSchema" => "metal_finish",
+                _ => "wallpaint_finish",
             };
             let (pi, value) = props
                 .get(key)
                 .ok_or_else(|| anyhow::anyhow!("missing finish property"))?;
-            ensure!(
-                value.as_i64() == Some(0),
-                "finish variant outside measured render profile"
-            );
+            let finish = value
+                .as_i64()
+                .ok_or_else(|| anyhow::anyhow!("invalid finish variant"))?;
             provenance.push(source(r, *pi, "m_value"));
-            if schema == "MetalSchema" { 0.7 } else { 0.9 }
+            if finish != 0 {
+                diagnostics.push(format!(
+                    "{schema} finish variant {finish} is outside the measured render profile; using the qualified base roughness"
+                ));
+            }
+            if matches!(schema, "MetalSchema" | "MetallicPaint") {
+                0.7
+            } else {
+                0.9
+            }
+        } else if matches!(schema, "GlazingSchema" | "Glazing-012") {
+            diagnostics.push(format!(
+                "{schema} retained with saved color/transparency; roughness is uncalibrated"
+            ));
+            0.1
         } else {
             let (ri, rv) = props
                 .get("generic_reflectivity_at_0deg")
@@ -409,7 +537,7 @@ fn project_material(
             )?
         }
     };
-    provenance.push(json!({"conversion_profile":"default_viewport","saved_asset_schema":schema,"roughness_rules":{"GenericSchema":"1-sqrt(direct)*(1-min(glossiness,0.999)^4)","Generic_without_asset":"1","MetalSchema_finish0":"1-0.3","WallPaintSchema_finish0":"1-0.1","HardwoodSchema":"preserve explicitly selected initialized Generic trait context"},"metallic":"zero factor","diffuse":"saved packed graphics RGB / 255"}));
+    provenance.push(json!({"conversion_profile":"default_viewport","saved_asset_schema":schema,"roughness_rules":{"GenericSchema":"1-sqrt(direct)*(1-min(glossiness,0.999)^4)","Generic_without_asset":"1","MetalSchema_or_MetallicPaint_finish0":"1-0.3","WallPaintSchema_finish0":"1-0.1","GlazingSchema_or_Glazing-012":"0.1; saved color/transparency retained, roughness uncalibrated","Plastic-*":"1.0; saved color retained, roughness uncalibrated","Paint-*":"1.0; saved color retained, roughness uncalibrated","HardwoodSchema":"preserve explicitly selected initialized Generic trait context"},"metallic":"zero factor","diffuse":"saved packed graphics RGB / 255"}));
     Ok(RenderMaterial {
         material_id: Some(r.identity.element_id as i64),
         name: m["m_name"].as_str().unwrap_or("").to_string(),
@@ -417,9 +545,48 @@ fn project_material(
         saved_opacity: Some(base_color[3]),
         metallic_factor: 0.0,
         roughness_factor: roughness,
-        diagnostics: Vec::new(),
+        saved_texture_references,
+        diagnostics,
         provenance,
     })
+}
+fn saved_texture_references(r: &Record, g: &ObjectGraph) -> Vec<SavedTextureReference> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut references = Vec::new();
+    for (object_index, object) in g.objects.iter().enumerate() {
+        if object.class_name != "APropertyString" {
+            continue;
+        }
+        let Some(slot) = object.fields["m_sName"].as_str() else {
+            continue;
+        };
+        if slot != "unifiedbitmap_Bitmap" && !slot.ends_with("_map") {
+            continue;
+        }
+        let Some(raw_value) = object.fields["m_value"].as_str() else {
+            continue;
+        };
+        let mut paths = Vec::new();
+        for path in raw_value
+            .split('|')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            if !paths.iter().any(|existing| existing == path) {
+                paths.push(path.to_owned());
+            }
+        }
+        if paths.is_empty() || !seen.insert((slot.to_owned(), raw_value.to_owned())) {
+            continue;
+        }
+        references.push(SavedTextureReference {
+            slot: slot.to_owned(),
+            paths,
+            raw_value: raw_value.to_owned(),
+            source: source(r, object_index, "m_sName/m_value"),
+        });
+    }
+    references
 }
 fn packed_color(m: &Value) -> Result<[f64; 4]> {
     let color = m["m_color"]
@@ -534,6 +701,14 @@ mod tests {
                 .material_id,
             None
         );
+        let material = Resolver::default_viewport_profile()
+            .resolve(1, None, 0, -4000038, None)
+            .unwrap();
+        assert!(material.diagnostics.iter().any(|d| d.contains("-4000038")));
+        assert!(material.provenance.iter().any(|p| {
+            p["source"] == "saved_negative_render_style_sentinel"
+                && p["render_style_id"] == -4000038
+        }));
     }
     #[test]
     fn paint_and_single_layer_context_override_saved_default_style() {
@@ -548,6 +723,7 @@ mod tests {
                     saved_opacity: Some(1.0),
                     metallic_factor: 0.0,
                     roughness_factor: 1.0,
+                    saved_texture_references: vec![],
                     diagnostics: vec![],
                     provenance: vec![],
                 },
@@ -588,6 +764,7 @@ mod tests {
                 saved_opacity: Some(0.0),
                 metallic_factor: 0.0,
                 roughness_factor: 1.0,
+                saved_texture_references: vec![],
                 diagnostics: vec![],
                 provenance: vec![],
             },

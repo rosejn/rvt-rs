@@ -289,9 +289,6 @@ impl Walker<'_, '_> {
                 }
             }
             "GInstance" => {
-                if obj.fields["m_bHasScale"].as_bool() != Some(false) {
-                    return Err("scaled instance mode is not qualified".into());
-                }
                 if obj.fields["m_resolveSymInView"].as_bool() != Some(false) {
                     return Err("view-resolved instance is unsupported".into());
                 }
@@ -303,6 +300,11 @@ impl Walker<'_, '_> {
                     return Err("unsupported instance-info class".into());
                 }
                 let transform = read_transform(&self.graph.objects[info].fields["m_Trf"])?;
+                if obj.fields["m_bHasScale"].as_bool() != Some(false)
+                    && !is_similarity_transform(transform)
+                {
+                    return Err("scaled instance transform is not a qualified similarity".into());
+                }
                 let embedded_pointer = &obj.fields["m_oEmbeddedSymbolGRep"];
                 if embedded_pointer["pointer_token"].as_u64() == Some(0) {
                     let info_fields = &self.graph.objects[info].fields;
@@ -423,6 +425,23 @@ fn read_transform(v: &Value) -> Result<GraphicsTransform, String> {
         return Err("singular instance transform".into());
     }
     Ok(m)
+}
+fn is_similarity_transform(m: GraphicsTransform) -> bool {
+    let columns: [[f64; 3]; 3] =
+        std::array::from_fn(|column| std::array::from_fn(|row| m[row][column]));
+    let lengths = columns.map(|v| v.iter().map(|x| x * x).sum::<f64>().sqrt());
+    let scale = lengths[0];
+    scale.is_finite()
+        && scale > 1e-12
+        && lengths
+            .iter()
+            .all(|length| (*length - scale).abs() <= scale * 1e-9)
+        && columns.iter().enumerate().all(|(i, a)| {
+            columns.iter().skip(i + 1).all(|b| {
+                let dot = a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+                dot.abs() <= scale * scale * 1e-9
+            })
+        })
 }
 fn multiply(a: GraphicsTransform, b: GraphicsTransform) -> GraphicsTransform {
     let mut result = [[0.; 4]; 4];
@@ -858,6 +877,27 @@ mod tests {
             assert_eq!(direction_condition(&v(c, true), IDENTITY), Ok(true));
         }
         assert!(direction_condition(&v(9, false), IDENTITY).is_err());
+    }
+    #[test]
+    fn scaled_instances_require_similarity_transforms() {
+        assert!(is_similarity_transform([
+            [-0.75, 0., 0., 4.],
+            [0., 0.75, 0., 5.],
+            [0., 0., 0.75, 6.],
+            [0., 0., 0., 1.],
+        ]));
+        assert!(!is_similarity_transform([
+            [2., 0.2, 0., 0.],
+            [0., 1., 0., 0.],
+            [0., 0., 1., 0.],
+            [0., 0., 0., 1.],
+        ]));
+        assert!(!is_similarity_transform([
+            [2., 0., 0., 0.],
+            [0., 1., 0., 0.],
+            [0., 0., 1., 0.],
+            [0., 0., 0., 1.],
+        ]));
     }
     #[test]
     fn hidden_auxiliary_group_suppresses_all_descendant_faces() {

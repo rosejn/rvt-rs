@@ -104,6 +104,10 @@ pub struct Inventory {
 #[derive(Default)]
 pub struct InventoryBuilder {
     identities: BTreeMap<u64, Identity>,
+    /// Document-scoped saved type-to-Family links.  These are collected even
+    /// though FamilySymbol records are not themselves spatial owners, then
+    /// applied only to FamilyInstance contexts during final resolution.
+    symbol_families: BTreeMap<i64, (i64, Source)>,
     elements: BTreeMap<u64, ElementContext>,
     ignored_record_classes: BTreeMap<String, usize>,
 }
@@ -123,6 +127,25 @@ impl InventoryBuilder {
             "duplicate current spatial-context record"
         );
         let class = record.class_name.as_deref().unwrap_or("<unregistered>");
+        if crate::native_parameter_definitions::is_family_symbol_definition_owner(class)
+            && let Some(graph) = &record.graph
+            && let Some(root) = graph.objects.first()
+            && let Some(value) = root.fields.get("m_familyId")
+        {
+            let symbol_id = i64::try_from(record.identity.element_id)?;
+            let family_id = identifier(value)?;
+            if let Some((previous, _)) = self.symbol_families.get(&symbol_id) {
+                ensure!(
+                    *previous == family_id,
+                    "conflicting FamilySymbol family reference"
+                );
+            } else {
+                self.symbol_families.insert(
+                    symbol_id,
+                    (family_id, source(record, 0, "m_familyId")),
+                );
+            }
+        }
         if !matches!(
             class,
             "FamilyInstance" | "RoomElem" | "RvtLinkInstance" | "RvtLinkSymbol"
@@ -174,6 +197,38 @@ impl InventoryBuilder {
         Ok(())
     }
     pub fn finish(mut self) -> Result<Inventory> {
+        for context in self.elements.values_mut() {
+            if context.class_name != "FamilyInstance" {
+                continue;
+            }
+            let Some(symbol_id) = context
+                .references
+                .get("type")
+                .and_then(|reference| reference.raw_target_id)
+            else {
+                continue;
+            };
+            let Some((family_id, family_source)) = self.symbol_families.get(&symbol_id) else {
+                continue;
+            };
+            ensure!(
+                context.references.get("family").is_none(),
+                "FamilyInstance already has a family reference"
+            );
+            context.references.insert(
+                "family".into(),
+                Reference {
+                    raw_target_id: Some(*family_id),
+                    target_identity: None,
+                    status: "unresolved".into(),
+                    observation: "saved_family_symbol_reference_chain",
+                    // The terminal saved hop is the FamilySymbol's actual
+                    // m_familyId field. The instance's first hop remains in
+                    // its separate `type` reference.
+                    source: family_source.clone(),
+                },
+            );
+        }
         for context in self.elements.values_mut() {
             for reference in context.references.values_mut() {
                 if let Some(raw) = reference.raw_target_id {
@@ -252,6 +307,7 @@ impl InventoryBuilder {
             ignored_record_classes: self.ignored_record_classes,
             supported_scope: vec![
                 "family_instance_cached_document_transform",
+                "saved_family_instance_type_to_family_reference_chain",
                 "saved_placement_point",
                 "level_host_phase_view_references",
                 "nested_family_membership",
@@ -767,6 +823,34 @@ mod tests {
             "negative_serialized_reference"
         );
         assert_eq!(element.references["group"].raw_target_id, None);
+    }
+    #[test]
+    fn family_instance_family_reference_uses_the_saved_symbol_chain() {
+        let mut symbol = record(2, json!({"m_familyId":3}));
+        symbol.class_name = Some("FamilySymbol".into());
+        symbol.graph.as_mut().unwrap().objects[0].class_name = "FamilySymbol".into();
+        let mut family = record(3, json!({"m_categoryId":-2000014}));
+        family.class_name = Some("Family".into());
+        family.graph.as_mut().unwrap().objects[0].class_name = "Family".into();
+        let instance = record(1, json!({
+            "m_pInstanceInfo":{"offset":2,"pointer_token":4294967295u32},
+            "m_masterSymbolId":2,"m_cellList":{"pointer_token":0}
+        }));
+        let mut builder = InventoryBuilder::default();
+        builder.ingest(&symbol).unwrap();
+        builder.ingest(&family).unwrap();
+        builder.ingest(&instance).unwrap();
+        let result = builder.finish().unwrap();
+        let element = &result.elements[0];
+        let family_reference = &element.references["family"];
+        assert_eq!(family_reference.raw_target_id, Some(3));
+        assert_eq!(family_reference.status, "resolved_current_element");
+        assert_eq!(family_reference.observation, "saved_family_symbol_reference_chain");
+        assert_eq!(family_reference.source.source_element_id, 2);
+        assert_eq!(
+            family_reference.target_identity.as_ref().unwrap().element_id,
+            3
+        );
     }
     #[test]
     fn wrong_transform_owner_and_missing_positive_reference_are_explicit() {

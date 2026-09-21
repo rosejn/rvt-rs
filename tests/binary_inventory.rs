@@ -52,6 +52,8 @@ fn number_word(n: usize) -> &'static str {
         23 => "Twenty-three",
         24 => "Twenty-four",
         25 => "Twenty-five",
+        26 => "Twenty-six",
+        27 => "Twenty-seven",
         other => panic!("extend number_word() for {other} binaries"),
     }
 }

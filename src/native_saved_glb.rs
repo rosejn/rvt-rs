@@ -180,6 +180,9 @@ mod tests {
                 source: json!({}),
                 referenced_graph_sources: BTreeMap::new(),
                 status: "test".into(),
+                requested_detail_level: 3,
+                effective_detail_level: 3,
+                detail_diagnostic: None,
                 render_materials: BTreeMap::new(),
                 unresolved_material_primitives: vec![0],
                 meshes: GraphicsMeshes {

@@ -46,6 +46,21 @@ impl Catalog {
         self.schemas.insert(schema.guid.clone(), schema);
         Ok(())
     }
+
+    /// Merge declarations whose provenance was independently bound to this
+    /// exact source document.  A native declaration always wins: accepting a
+    /// conflicting external declaration would turn a witness into an override.
+    pub fn extend_nonconflicting(&mut self, other: Catalog) -> Result<()> {
+        for schema in other.schemas.into_values() {
+            ensure!(
+                !self.schemas.contains_key(&schema.guid),
+                "source-bound ES schema conflicts with file-local declaration {}",
+                schema.guid
+            );
+            self.insert(schema)?;
+        }
+        Ok(())
+    }
 }
 
 /// Format the GUID's little-endian first three components, retaining the
@@ -290,5 +305,25 @@ mod tests {
         bad.guid = "other".into();
         bad.fields[0].index = 0;
         assert!(catalog.insert(bad).is_err());
+    }
+
+    #[test]
+    fn source_bound_catalog_cannot_override_file_local_schema() {
+        let schema = |guid: &str| Schema {
+            guid: guid.into(),
+            name: "test".into(),
+            fields: vec![],
+            raw_metadata: Value::Null,
+        };
+        let mut file_local = Catalog::default();
+        file_local
+            .insert(schema("00000000-0000-0000-0000-000000000001"))
+            .unwrap();
+        let mut witness = Catalog::default();
+        witness
+            .insert(schema("00000000-0000-0000-0000-000000000001"))
+            .unwrap();
+        assert!(file_local.extend_nonconflicting(witness).is_err());
+        assert_eq!(file_local.schemas.len(), 1);
     }
 }
